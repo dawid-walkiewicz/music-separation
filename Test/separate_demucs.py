@@ -1,4 +1,3 @@
-import os
 import sys
 import subprocess
 from pathlib import Path
@@ -37,17 +36,26 @@ def separate_with_demucs(file_path: str):
     command = [
         sys.executable, "-m", "demucs",
         "-n", "htdemucs",
+        "-o", str(output_root),  # zapis do ./separated
         str(audio_path)
     ]
 
     try:
-        subprocess.run(command, check=True)
+        proc = subprocess.run(command, check=True, capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print("[demucs stderr]", proc.stderr)
     except subprocess.CalledProcessError as e:
         print("❌ Błąd podczas działania Demucs:", e)
+        if e.stdout:
+            print("stdout:", e.stdout)
+        if e.stderr:
+            print("stderr:", e.stderr)
         return
 
     # Szukamy wyników w ./separated/htdemucs/<nazwa_pliku> (domyślna lokalizacja Demucsa)
-    demucs_base = Path("separated") / "htdemucs" / audio_path.stem
+    demucs_base = output_root / "htdemucs" / audio_path.stem
     if not demucs_base.exists():
         print("❌ Nie znaleziono wyników Demucs:", demucs_base)
         return
@@ -55,7 +63,12 @@ def separate_with_demucs(file_path: str):
     # Przenosimy wszystkie pliki .wav do naszego folderu ./separated/<nazwa_utworu>/
     for wav in demucs_base.glob("*.wav"):
         dest = output_song_dir / wav.name
-        wav.replace(dest)
+        try:
+            wav.replace(dest)
+        except Exception:
+            # jeśli przeniesienie nie działa, spróbuj skopiować
+            import shutil
+            shutil.copy2(wav, dest)
         print(f"✅ Zapisano: {dest}")
 
     # Usuwamy oryginalny folder demucsa (opcjonalnie)
