@@ -86,7 +86,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 4) Uruchom trening (przykład bezpieczny pamięciowo):
 ```bat
-python -m traning.train --data_root .\musdb18 --workdir .\runs\unet1d ^
+python -m training.train --data_root .\musdb18 --workdir .\runs\unet1d ^
   --batch_size 2 --segment_seconds 2.0 --num_workers 0 ^
   --max_steps 2000 --ckpt_every 200 --log_every 20
 ```
@@ -121,10 +121,11 @@ Do czego służą:
   - separacji nowych plików audio (inferencja).
 
 Przykładowa inferencja w Pythonie (opcjonalnie):
+
 ```python
 import torch
 import numpy as np
-from traning.model import UNet1D, apply_masks
+from training.model import UNet1D, apply_masks
 
 # Załaduj model
 model = UNet1D(n_sources=4)

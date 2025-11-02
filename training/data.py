@@ -1,9 +1,11 @@
+import os
 import random
 from typing import List, Dict
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import soundfile as sf
 
 
 class MusdbRandomChunks(Dataset):
@@ -18,7 +20,7 @@ class MusdbRandomChunks(Dataset):
 
     def __init__(
         self,
-        root: str = "./musdb18",
+        root: str = "./musdb18-wav",
         subset: str = "train",
         sources: List[str] = ("vocals", "drums", "bass", "other"),
         sample_rate: int = 44100,
@@ -40,7 +42,7 @@ class MusdbRandomChunks(Dataset):
         self.db = musdb.DB(
             root=root,
             subsets=[subset],
-            is_wav=False,  # .stem.mp4
+            is_wav=True,  # .stem.mp4
         )
         self.tracks = list(iter(self.db))
         if len(self.tracks) == 0:
@@ -50,6 +52,7 @@ class MusdbRandomChunks(Dataset):
 
         self.sources = list(sources)
         self.sample_rate = sample_rate
+        self.segment_seconds = segment_seconds
         self.segment_samples = int(segment_seconds * sample_rate)
         self.items_per_epoch = int(items_per_epoch)
         self.mono = mono
@@ -86,37 +89,47 @@ class MusdbRandomChunks(Dataset):
         # Wybieramy losowy utwór i losowy start (po osi czasu)
         track = self.rng.choice(self.tracks)
 
-        # Ustal długość na podstawie jednego źródła (po normalizacji do (C, L))
-        first_audio = track.sources[self.sources[0]].audio
-        first_audio = self._ensure_channels_first(first_audio)
-        length_samples = int(first_audio.shape[1])
+        track_length_samples = int(track.duration * self.sample_rate)
 
-        if length_samples <= self.segment_samples:
-            start = 0
-        else:
-            start = self.rng.randint(0, length_samples - self.segment_samples)
+        start_sample = 0
 
-        # Pobieramy źródła, normalizujemy do (C, L) i wycinamy po L
+        if track_length_samples > self.segment_samples:
+            start_sample = self.rng.randint(0, track_length_samples - self.segment_samples)
+
+        track.chunk_start = start_sample / self.sample_rate
+        track.chunk_duration = self.segment_seconds
+
         target_list = []
         for src in self.sources:
+            source_file_path = str(track.sources[src].path)
+            try:
+                sf.info(source_file_path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"KRYTYCZNY BŁĄD: Plik WAV jest uszkodzony lub nieczytelny: {source_file_path}\n"
+                    f"Utwór: {track.name}\n"
+                    f"Oryginalny błąd 'soundfile': {e}\n"
+                    f"Proszę naprawić konwersję tego pliku."
+                )
+
             audio = track.sources[src].audio
-            audio = self._ensure_channels_first(audio)  # (C, L)
-            audio_seg = audio[:, start : start + self.segment_samples]
-            # Jeśli końcówka krótsza — dopełnij po osi czasu
-            L_here = audio_seg.shape[1]
+            audio = self._ensure_channels_first(audio)
+
+            L_here = audio.shape[1]
             if L_here < self.segment_samples:
                 pad = self.segment_samples - L_here
-                audio_seg = np.pad(audio_seg, ((0, 0), (0, pad)))
-            target_list.append(self._to_tensor(audio_seg))  # (C, L)
+                audio = np.pad(audio, ((0, 0), (0, pad)))
 
-        # Miks jako suma źródeł (S, C, L) -> (C, L)
+            if audio.shape[1] > self.segment_samples:
+                audio = audio[:, :self.segment_samples]
+
+            target_list.append(self._to_tensor(audio))  # (C, L)
+
         stacked = torch.stack(target_list, dim=0)
         mixture = stacked.sum(dim=0)
 
-        # Składamy tensor docelowy: (S, C, L)
         targets = stacked
 
-        # Zwracamy mixture (C, L) i targets (S, C, L)
         return {
             "mixture": mixture,
             "targets": targets,
