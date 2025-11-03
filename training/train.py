@@ -15,7 +15,7 @@ torch.backends.cudnn.benchmark = True
 
 
 class EMA:
-    """Prosty Exponential Moving Average dla stabilizacji ewaluacji."""
+    """Simple Exponential Moving Average for stabilizing evaluation."""
 
     def __init__(self, model: torch.nn.Module, decay: float = 0.999):
         self.decay = decay
@@ -40,8 +40,8 @@ class EMA:
 
 def seed_worker(worker_id):
     """
-    Funkcja wywoływana przez DataLoader dla każdego workera.
-    Zapewnia, że każdy worker ma unikalne ziarno losowości.
+    Function called by DataLoader for each worker.
+    Ensures each worker gets a unique random seed.
     """
     worker_info = torch.utils.data.get_worker_info()
     dataset = worker_info.dataset
@@ -55,6 +55,7 @@ def seed_worker(worker_id):
 
 def train(
         data_root: str = "./musdb18-wav",
+        data_format: str = "wav",
         workdir: str = "./runs/unet1d",
         batch_size: int = 4,
         lr: float = 2e-4,
@@ -65,7 +66,7 @@ def train(
         num_workers: int = 4,
         sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
         seed: int = 42,
-        resume: str | None = None,  # ścieżka do .pt lub "auto"
+        resume: str | None = None,
         log_level: int = 0
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,6 +82,7 @@ def train(
 
     dataset = MusdbRandomChunks(
         root=data_root,
+        data_format=data_format,
         subset="train",
         sources=list(sources),
         segment_seconds=segment_seconds,
@@ -112,7 +114,7 @@ def train(
     ckpt_dir = workdir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Opcjonalne wznowienie
+    # Optional resume
     step = 0
     epoch = 0
     if resume:
@@ -120,15 +122,15 @@ def train(
         if resume == "auto":
             ckpt_path = find_latest_checkpoint(ckpt_dir)
             if ckpt_path is None:
-                print("Brak checkpointów do auto-wznowienia — start od zera.")
+                print("No checkpoints found for auto-resume — starting from scratch.")
         else:
             ckpt_path = Path(resume)
             if not ckpt_path.exists():
-                print(f"Ostrzeżenie: nie znaleziono {ckpt_path}, start od zera.")
+                print(f"Warning: {ckpt_path} not found, starting from scratch.")
                 ckpt_path = None
         if ckpt_path is not None:
             step, epoch = load_checkpoint(ckpt_path, model, optimizer, scaler)
-            print(f"Wznowiono z: {ckpt_path} | step={step} epoch={epoch}")
+            print(f"Resumed from: {ckpt_path} | step={step} epoch={epoch}")
 
     running_loss = 0.0
     last_log_time = time.monotonic()
@@ -160,7 +162,7 @@ def train(
                 masks = model(mixture)  # (B, S, Lm)
                 preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
                 Lp = preds.shape[-1]
-                targets_c = targets[..., :Lp]  # dopasuj długość
+                targets_c = targets[..., :Lp]  # match length
                 loss = (preds - targets_c).abs().mean()
 
             if use_cuda and log_level == 2:
@@ -221,17 +223,17 @@ def train(
 
                     total_measured_ms = avg_data_time_ms + avg_forward_time_ms + avg_backward_time_ms + avg_optimizer_time_ms
 
-                    print(f"  Średnie czasy na krok (razem zmierzone: {total_measured_ms:.2f} ms):")
+                    print(f"  Average times per step (total measured: {total_measured_ms:.2f} ms):")
 
                     if total_measured_ms > 0:
                         print(
-                            f"    - Ładowanie Danych: {avg_data_time_ms:8.2f} ms ({avg_data_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Data Loading:       {avg_data_time_ms:8.2f} ms ({avg_data_time_ms / total_measured_ms * 100:5.1f}%)")
                         print(
-                            f"    - Forward Pass:     {avg_forward_time_ms:8.2f} ms ({avg_forward_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Forward Pass:       {avg_forward_time_ms:8.2f} ms ({avg_forward_time_ms / total_measured_ms * 100:5.1f}%)")
                         print(
-                            f"    - Backward Pass:    {avg_backward_time_ms:8.2f} ms ({avg_backward_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Backward Pass:      {avg_backward_time_ms:8.2f} ms ({avg_backward_time_ms / total_measured_ms * 100:5.1f}%)")
                         print(
-                            f"    - Optimizer/Update: {avg_optimizer_time_ms:8.2f} ms ({avg_optimizer_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Optimizer/Update:   {avg_optimizer_time_ms:8.2f} ms ({avg_optimizer_time_ms / total_measured_ms * 100:5.1f}%)")
 
                 running_loss = 0.0
                 last_log_time = current_time
@@ -245,7 +247,7 @@ def train(
             if step % ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:06d}.pt"
                 save_checkpoint(ckpt_path, model, optimizer, step, epoch, scaler)
-                print(f"Zapisano checkpoint: {ckpt_path}")
+                print(f"Saved checkpoint: {ckpt_path}")
 
             if step >= max_steps:
                 break
@@ -254,17 +256,24 @@ def train(
                 data_start_time = time.monotonic()
         epoch += 1
 
-    # Zapis końcowy
+    # Final save
     ckpt_path = ckpt_dir / f"final_step_{step:06d}.pt"
     save_checkpoint(ckpt_path, model, optimizer, step, epoch, scaler)
-    print(f"Zapisano checkpoint końcowy: {ckpt_path}")
+    print(f"Saved final checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Trenowanie 1D U-Net do separacji źródeł audio (MUSDB18)")
+    parser = argparse.ArgumentParser(description="Train a 1D U-Net for audio source separation (MUSDB18)")
     parser.add_argument("--data_root", type=str, default="./musdb18-wav")
+    parser.add_argument(
+        "--data_format",
+        type=str,
+        default="wav",
+        choices=["wav", "stem"],
+        help="Input data format for MUSDB18: 'wav' (default) or 'stem'.",
+    )
     parser.add_argument("--workdir", type=str, default="./runs/unet1d")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -274,9 +283,9 @@ if __name__ == "__main__":
     parser.add_argument("--segment_seconds", type=float, default=6.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume", type=str, default=None, help='ścieżka do ckpt lub "auto"')
+    parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
     parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
-                        help="Poziom logowania: 0 (min), 1 (+data/czas), 2 (wszystko)")
+                        help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)")
 
     args = parser.parse_args()
 
@@ -284,6 +293,7 @@ if __name__ == "__main__":
 
     train(
         data_root=args.data_root,
+        data_format=args.data_format,
         workdir=args.workdir,
         batch_size=args.batch_size,
         lr=args.lr,

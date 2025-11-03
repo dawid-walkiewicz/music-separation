@@ -31,7 +31,7 @@ def load_checkpoint(path: Path,
                     model: torch.nn.Module,
                     optimizer: torch.optim.Optimizer | None = None,
                     scaler: torch.cuda.amp.GradScaler | None = None):
-    ckpt = torch.load(str(path), map_location="cpu")
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt and ckpt["optimizer"]:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -40,6 +40,7 @@ def load_checkpoint(path: Path,
     step = int(ckpt.get("step", 0))
     epoch = int(ckpt.get("epoch", 0))
     return step, epoch
+
 
 def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:
     if not ckpt_dir.exists():
