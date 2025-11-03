@@ -4,7 +4,6 @@ from typing import List, Dict
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import soundfile as sf
 
 
 class MusdbRandomChunks(Dataset):
