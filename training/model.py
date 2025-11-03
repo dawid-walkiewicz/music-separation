@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 def _match_time(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Przytnij oba tensory do wspólnej (minimalnej) długości po osi czasu."""
+    """Trim both tensors to a common (minimum) length along the time axis."""
     L = min(a.shape[-1], b.shape[-1])
     if a.shape[-1] != L:
         a = a[..., :L]
@@ -27,9 +27,9 @@ class ConvBlock(nn.Module):
 
 class UNet1D(nn.Module):
     """
-    Prosty 1D U-Net do separacji źródeł w dziedzinie czasowej.
-    Wejście: mixture (C, L) gdzie C=1, L=segment_samples
-    Wyjście: maski dla S źródeł: (S, C, L). Mnożone przez mixture -> predykcja źródeł.
+    Simple 1D U-Net for time-domain source separation.
+    Input: mixture (C, L) where C=1, L=segment_samples
+    Output: masks for S sources: (S, C, L). Multiplied by mixture -> predicted sources.
     """
 
     def __init__(self, n_sources: int = 4, base: int = 64):
@@ -60,9 +60,9 @@ class UNet1D(nn.Module):
         self.u1 = nn.ConvTranspose1d(ch * 2, ch, 4, 2, 1)
         self.p1 = nn.Sequential(ConvBlock(ch * 2, ch), ConvBlock(ch, ch))
 
-        # Wyjście masek
+        # Output masks
         self.out = nn.Conv1d(ch, n_sources, 1)
-        self.act_out = nn.Sigmoid()  # maski w [0,1]
+        self.act_out = nn.Sigmoid()  # masks in [0,1]
 
     def forward(self, mixture: torch.Tensor) -> torch.Tensor:
         # mixture: (B, C=1, L)
@@ -94,7 +94,7 @@ def apply_masks(mixture: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
     """
     mixture: (B, 1, L)
     masks: (B, S, Lm)
-    -> sources: (B, S, 1, Lc) gdzie Lc = min(L, Lm)
+    -> sources: (B, S, 1, Lc) where Lc = min(L, Lm)
     """
     Lc = min(mixture.shape[-1], masks.shape[-1])
     mixture = mixture[..., :Lc]
