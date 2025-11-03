@@ -1,8 +1,11 @@
 from pathlib import Path
 import time
+from datetime import datetime
 
 import torch
 from torch.utils.data import DataLoader
+import numpy as np
+import random
 
 from training.data import MusdbRandomChunks
 from training.model import UNet1D, apply_masks
@@ -35,6 +38,21 @@ class EMA:
                 param.data.copy_(self.shadow[name])
 
 
+def seed_worker(worker_id):
+    """
+    Funkcja wywoływana przez DataLoader dla każdego workera.
+    Zapewnia, że każdy worker ma unikalne ziarno losowości.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset
+
+    worker_seed = worker_info.seed % 2 ** 32
+
+    dataset.rng = random.Random(worker_seed)
+
+    np.random.seed(worker_seed)
+
+
 def train(
         data_root: str = "./musdb18-wav",
         workdir: str = "./runs/unet1d",
@@ -48,6 +66,7 @@ def train(
         sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
         seed: int = 42,
         resume: str | None = None,  # ścieżka do .pt lub "auto"
+        log_level: int = 0
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -69,13 +88,19 @@ def train(
         mono=True,
         seed=seed,
     )
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=use_cuda,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None)
+        prefetch_factor=(2 if num_workers > 0 else None),
+        worker_init_fn=seed_worker,
+        generator=g,
     )
 
     model = UNet1D(n_sources=len(sources), base=64).to(device)
@@ -107,23 +132,25 @@ def train(
 
     running_loss = 0.0
     last_log_time = time.monotonic()
-    acc_data_time = 0.0
-    acc_forward_time = 0.0
-    acc_backward_time = 0.0
-    acc_optimizer_time = 0.0
 
-    step_start_time = time.monotonic()
+    if log_level == 2:
+        acc_data_time = 0.0
+        acc_forward_time = 0.0
+        acc_backward_time = 0.0
+        acc_optimizer_time = 0.0
 
     while step < max_steps:
-        data_start_time = time.monotonic()
+        if log_level == 2:
+            data_start_time = time.monotonic()
 
         for batch in loader:
-            if use_cuda:
+            if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
-            data_end_time = time.monotonic()
-            acc_data_time += (data_end_time - data_start_time)
+            if log_level == 2:
+                data_end_time = time.monotonic()
+                acc_data_time += (data_end_time - data_start_time)
 
-            forward_start_time = time.monotonic()
+                forward_start_time = time.monotonic()
 
             mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C=1, L)
             targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C=1, L)
@@ -136,30 +163,33 @@ def train(
                 targets_c = targets[..., :Lp]  # dopasuj długość
                 loss = (preds - targets_c).abs().mean()
 
-            if use_cuda:
+            if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
-            forward_end_time = time.monotonic()
-            acc_forward_time += (forward_end_time - forward_start_time)
+            if log_level == 2:
+                forward_end_time = time.monotonic()
+                acc_forward_time += (forward_end_time - forward_start_time)
 
-            backward_start_time = time.monotonic()
+                backward_start_time = time.monotonic()
 
             scaler.scale(loss).backward()
 
-            if use_cuda:
+            if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
-            backward_end_time = time.monotonic()
-            acc_backward_time += (backward_end_time - backward_start_time)
+            if log_level == 2:
+                backward_end_time = time.monotonic()
+                acc_backward_time += (backward_end_time - backward_start_time)
 
-            optimizer_start_time = time.monotonic()
+                optimizer_start_time = time.monotonic()
 
             scaler.step(optimizer)
             scaler.update()
             ema.update(model)
 
-            if use_cuda:
+            if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
-            optimizer_end_time = time.monotonic()
-            acc_optimizer_time += (optimizer_end_time - optimizer_start_time)
+            if log_level == 2:
+                optimizer_end_time = time.monotonic()
+                acc_optimizer_time += (optimizer_end_time - optimizer_start_time)
 
             running_loss += float(loss.item())
             step += 1
@@ -171,33 +201,46 @@ def train(
                 total_duration_wall = current_time - last_log_time
                 steps_per_sec = log_every / total_duration_wall
 
-                avg_data_time_ms = (acc_data_time / log_every) * 1000
-                avg_forward_time_ms = (acc_forward_time / log_every) * 1000
-                avg_backward_time_ms = (acc_backward_time / log_every) * 1000
-                avg_optimizer_time_ms = (acc_optimizer_time / log_every) * 1000
+                log_parts = []
 
-                total_measured_ms = avg_data_time_ms + avg_forward_time_ms + avg_backward_time_ms + avg_optimizer_time_ms
+                if log_level >= 1:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    log_parts.append(f"[{timestamp}]")
 
-                print(f"\n--- Step {step:6d} ---")
-                print(f"  Ogólnie:   {steps_per_sec:.2f} steps/s | Avg Loss: {avg_loss:.5f}")
-                print(f"  Średnie czasy na krok (razem zmierzone: {total_measured_ms:.2f} ms):")
+                log_parts.append(f"Step {step:6d}")
+                log_parts.append(f"Avg Loss: {avg_loss:.5f}")
+                log_parts.append(f"{steps_per_sec:.2f} steps/s")
 
-                if total_measured_ms > 0:
-                    print(
-                        f"    - Ładowanie Danych: {avg_data_time_ms:8.2f} ms ({avg_data_time_ms / total_measured_ms * 100:5.1f}%)")
-                    print(
-                        f"    - Forward Pass:     {avg_forward_time_ms:8.2f} ms ({avg_forward_time_ms / total_measured_ms * 100:5.1f}%)")
-                    print(
-                        f"    - Backward Pass:    {avg_backward_time_ms:8.2f} ms ({avg_backward_time_ms / total_measured_ms * 100:5.1f}%)")
-                    print(
-                        f"    - Optimizer/Update: {avg_optimizer_time_ms:8.2f} ms ({avg_optimizer_time_ms / total_measured_ms * 100:5.1f}%)")
+                print(f"\n{' | '.join(log_parts)}")
+
+                if log_level == 2:
+                    avg_data_time_ms = (acc_data_time / log_every) * 1000
+                    avg_forward_time_ms = (acc_forward_time / log_every) * 1000
+                    avg_backward_time_ms = (acc_backward_time / log_every) * 1000
+                    avg_optimizer_time_ms = (acc_optimizer_time / log_every) * 1000
+
+                    total_measured_ms = avg_data_time_ms + avg_forward_time_ms + avg_backward_time_ms + avg_optimizer_time_ms
+
+                    print(f"  Średnie czasy na krok (razem zmierzone: {total_measured_ms:.2f} ms):")
+
+                    if total_measured_ms > 0:
+                        print(
+                            f"    - Ładowanie Danych: {avg_data_time_ms:8.2f} ms ({avg_data_time_ms / total_measured_ms * 100:5.1f}%)")
+                        print(
+                            f"    - Forward Pass:     {avg_forward_time_ms:8.2f} ms ({avg_forward_time_ms / total_measured_ms * 100:5.1f}%)")
+                        print(
+                            f"    - Backward Pass:    {avg_backward_time_ms:8.2f} ms ({avg_backward_time_ms / total_measured_ms * 100:5.1f}%)")
+                        print(
+                            f"    - Optimizer/Update: {avg_optimizer_time_ms:8.2f} ms ({avg_optimizer_time_ms / total_measured_ms * 100:5.1f}%)")
 
                 running_loss = 0.0
                 last_log_time = current_time
-                acc_data_time = 0.0
-                acc_forward_time = 0.0
-                acc_backward_time = 0.0
-                acc_optimizer_time = 0.0
+
+                if log_level == 2:
+                    acc_data_time = 0.0
+                    acc_forward_time = 0.0
+                    acc_backward_time = 0.0
+                    acc_optimizer_time = 0.0
 
             if step % ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:06d}.pt"
@@ -207,7 +250,8 @@ def train(
             if step >= max_steps:
                 break
 
-            data_start_time = time.monotonic()
+            if log_level == 2:
+                data_start_time = time.monotonic()
         epoch += 1
 
     # Zapis końcowy
@@ -231,6 +275,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None, help='ścieżka do ckpt lub "auto"')
+    parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
+                        help="Poziom logowania: 0 (min), 1 (+data/czas), 2 (wszystko)")
 
     args = parser.parse_args()
 
@@ -248,4 +294,5 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         seed=args.seed,
         resume=args.resume,
+        log_level=args.log_level,
     )
