@@ -10,6 +10,7 @@ import random
 from training.data import MusdbRandomChunks
 from training.model import UNet1D, apply_masks
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
+from training.losses import get_loss_fn
 
 torch.backends.cudnn.benchmark = True
 
@@ -52,7 +53,6 @@ def seed_worker(worker_id):
 
     np.random.seed(worker_seed)
 
-
 def train(
         data_root: str = "./musdb18-wav",
         data_format: str = "wav",
@@ -67,7 +67,8 @@ def train(
         sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
         seed: int = 42,
         resume: str | None = None,
-        log_level: int = 0
+        log_level: int = 0,
+        loss_name: str = "si_sdr_l1",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -107,8 +108,12 @@ def train(
 
     model = UNet1D(n_sources=len(sources), base=64).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     ema = EMA(model, decay=0.999)
+
+    # Select loss function
+    loss_fn = get_loss_fn(loss_name)
+    print(f"Using loss: {loss_name}")
 
     workdir = Path(workdir)
     ckpt_dir = workdir / "checkpoints"
@@ -163,14 +168,13 @@ def train(
                 preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
                 Lp = preds.shape[-1]
                 targets_c = targets[..., :Lp]  # match length
-                loss = (preds - targets_c).abs().mean()
+                loss = loss_fn(preds, targets_c)
 
             if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
             if log_level == 2:
                 forward_end_time = time.monotonic()
                 acc_forward_time += (forward_end_time - forward_start_time)
-
                 backward_start_time = time.monotonic()
 
             scaler.scale(loss).backward()
@@ -286,6 +290,9 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
     parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
                         help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)")
+    parser.add_argument("--loss", type=str, default="si_sdr_l1",
+                        choices=["l1", "si_sdr", "mrstft", "si_sdr_l1", "combo", "perceptual"],
+                        help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid), combo (si_sdr + 0.1*mrstft), perceptual (si_sdr + 0.5*l1 + 0.2*mrstft)")
 
     args = parser.parse_args()
 
@@ -305,4 +312,5 @@ if __name__ == "__main__":
         seed=args.seed,
         resume=args.resume,
         log_level=args.log_level,
+        loss_name=args.loss,
     )

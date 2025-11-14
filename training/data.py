@@ -114,8 +114,8 @@ class MusdbRandomChunks(Dataset):
 
             target_list.append(self._to_tensor(audio))  # (C, L)
 
-        stacked = torch.stack(target_list, dim=0)
-        mixture = stacked.sum(dim=0)
+        stacked = torch.stack(target_list, dim=0) # (S, C, L)
+        mixture = stacked.sum(dim=0) # (C, L)
 
         targets = stacked
 
