@@ -8,6 +8,7 @@ import numpy as np
 import random
 
 from training.data import MusdbRandomChunks
+from training.evaluate import evaluate
 from training.model import UNet1D, apply_masks
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
 from training.losses import get_loss_fn
@@ -69,6 +70,7 @@ def train(
         resume: str | None = None,
         log_level: int = 0,
         loss_name: str = "si_sdr_l1",
+        eval_every: int = 1000,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -139,6 +141,8 @@ def train(
 
     running_loss = 0.0
     last_log_time = time.monotonic()
+
+    best_si_sdr = -float("inf")
 
     if log_level == 2:
         acc_data_time = 0.0
@@ -248,6 +252,29 @@ def train(
                     acc_backward_time = 0.0
                     acc_optimizer_time = 0.0
 
+            if step % eval_every == 0:
+                print("\n[Eval] Copying EMA weights and computing metrics on the validation set...")
+                backup_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                ema.copy_to(model)
+                metrics = evaluate(
+                    model,
+                    data_root=data_root,
+                    data_format=data_format,
+                    sources=sources,
+                    segment_seconds=segment_seconds,
+                    device=device,
+                    max_batches=20,
+                )
+                model.load_state_dict(backup_state)
+
+                print(f"[Eval] Step {step:6d} | SDR: {metrics['sdr']:.2f} dB | SI-SDR: {metrics['si_sdr']:.2f} dB")
+
+                if metrics["si_sdr"] > best_si_sdr:
+                    best_si_sdr = metrics["si_sdr"]
+                    best_ckpt = ckpt_dir / "best_sisdr.pt"
+                    save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler)
+                    print(f"[Eval] New best model (SI-SDR={best_si_sdr:.2f} dB) has been saved to {best_ckpt}")
+
             if step % ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:06d}.pt"
                 save_checkpoint(ckpt_path, model, optimizer, step, epoch, scaler)
@@ -293,6 +320,8 @@ if __name__ == "__main__":
     parser.add_argument("--loss", type=str, default="si_sdr_l1",
                         choices=["l1", "si_sdr", "mrstft", "si_sdr_l1", "combo", "perceptual"],
                         help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid), combo (si_sdr + 0.1*mrstft), perceptual (si_sdr + 0.5*l1 + 0.2*mrstft)")
+    parser.add_argument("--eval_every", type=int, default=1000,
+                        help="Co ile kroków liczyć metryki SDR/si-SDR na zbiorze walidacyjnym")
 
     args = parser.parse_args()
 
@@ -313,4 +342,5 @@ if __name__ == "__main__":
         resume=args.resume,
         log_level=args.log_level,
         loss_name=args.loss,
+        eval_every=args.eval_every,
     )
