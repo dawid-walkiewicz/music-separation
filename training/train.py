@@ -8,8 +8,9 @@ import numpy as np
 import random
 
 from training.data import MusdbRandomChunks
-from training.model import UNet1D, apply_masks
+from training.model import HybridTimeFreqUNet, apply_masks, similarity_percent
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
+
 
 torch.backends.cudnn.benchmark = True
 
@@ -39,35 +40,29 @@ class EMA:
 
 
 def seed_worker(worker_id):
-    """
-    Function called by DataLoader for each worker.
-    Ensures each worker gets a unique random seed.
-    """
+    """DataLoader worker seeding for deterministic behaviour."""
     worker_info = torch.utils.data.get_worker_info()
     dataset = worker_info.dataset
-
     worker_seed = worker_info.seed % 2 ** 32
-
     dataset.rng = random.Random(worker_seed)
-
     np.random.seed(worker_seed)
 
 
 def train(
-        data_root: str = "./musdb18-wav",
-        data_format: str = "wav",
-        workdir: str = "./runs/unet1d",
-        batch_size: int = 4,
-        lr: float = 2e-4,
-        max_steps: int = 10_000,
-        log_every: int = 50,
-        ckpt_every: int = 500,
-        segment_seconds: float = 6.0,
-        num_workers: int = 4,
-        sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
-        seed: int = 42,
-        resume: str | None = None,
-        log_level: int = 0
+    data_root: str = "./musdb18-wav",
+    data_format: str = "wav",
+    workdir: str = "./runs/unet1d",
+    batch_size: int = 4,
+    lr: float = 2e-4,
+    max_steps: int = 10_000,
+    log_every: int = 50,
+    ckpt_every: int = 500,
+    segment_seconds: float = 6.0,
+    num_workers: int = 4,
+    sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
+    seed: int = 42,
+    resume: str | None = None,
+    log_level: int = 0,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -80,6 +75,7 @@ def train(
     else:
         print("Device: CPU | AMP: False")
 
+    # Dataset & loader
     dataset = MusdbRandomChunks(
         root=data_root,
         data_format=data_format,
@@ -105,9 +101,16 @@ def train(
         generator=g,
     )
 
-    model = UNet1D(n_sources=len(sources), base=64).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
+    # Model, optimizer, EMA
+    model = HybridTimeFreqUNet(
+        n_sources=len(sources),
+        base_time=128,
+        base_freq=64,
+        n_fft=2048,
+        hop_length=512,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.amp.GradScaler(enabled=use_cuda)
     ema = EMA(model, decay=0.999)
 
     workdir = Path(workdir)
@@ -133,54 +136,54 @@ def train(
             print(f"Resumed from: {ckpt_path} | step={step} epoch={epoch}")
 
     running_loss = 0.0
+    running_similarity = 0.0
     last_log_time = time.monotonic()
 
-    if log_level == 2:
-        acc_data_time = 0.0
-        acc_forward_time = 0.0
-        acc_backward_time = 0.0
-        acc_optimizer_time = 0.0
+    # Akumulatory pomiaru czasu (używane tylko gdy log_level==2, ale zawsze zainicjalizowane)
+    acc_data_time = 0.0
+    acc_forward_time = 0.0
+    acc_backward_time = 0.0
+    acc_optimizer_time = 0.0
 
     while step < max_steps:
         if log_level == 2:
             data_start_time = time.monotonic()
 
         for batch in loader:
+            if step >= max_steps:
+                break
+
             if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
             if log_level == 2:
                 data_end_time = time.monotonic()
-                acc_data_time += (data_end_time - data_start_time)
-
+                acc_data_time += data_end_time - data_start_time
                 forward_start_time = time.monotonic()
 
-            mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C=1, L)
-            targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C=1, L)
+            mixture = batch["mixture"].to(device, non_blocking=True)  # (B, 1, L)
+            targets = batch["targets"].to(device, non_blocking=True)  # (B, S, 1, L)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
+            with torch.amp.autocast(device_type="cuda" if use_cuda else "cpu", enabled=use_cuda):
                 masks = model(mixture)  # (B, S, Lm)
                 preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
                 Lp = preds.shape[-1]
-                targets_c = targets[..., :Lp]  # match length
+                targets_c = targets[..., :Lp]
                 loss = (preds - targets_c).abs().mean()
 
             if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
             if log_level == 2:
                 forward_end_time = time.monotonic()
-                acc_forward_time += (forward_end_time - forward_start_time)
-
+                acc_forward_time += forward_end_time - forward_start_time
                 backward_start_time = time.monotonic()
 
             scaler.scale(loss).backward()
 
             if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
-            if log_level == 2:
                 backward_end_time = time.monotonic()
-                acc_backward_time += (backward_end_time - backward_start_time)
-
+                acc_backward_time += backward_end_time - backward_start_time
                 optimizer_start_time = time.monotonic()
 
             scaler.step(optimizer)
@@ -189,71 +192,79 @@ def train(
 
             if use_cuda and log_level == 2:
                 torch.cuda.synchronize()
-            if log_level == 2:
                 optimizer_end_time = time.monotonic()
-                acc_optimizer_time += (optimizer_end_time - optimizer_start_time)
+                acc_optimizer_time += optimizer_end_time - optimizer_start_time
 
             running_loss += float(loss.item())
+            batch_similarity = similarity_percent(preds.detach(), targets_c.detach())
+            running_similarity += batch_similarity
             step += 1
 
             if step % log_every == 0:
                 avg_loss = running_loss / log_every
+                avg_similarity = running_similarity / log_every
 
                 current_time = time.monotonic()
                 total_duration_wall = current_time - last_log_time
-                steps_per_sec = log_every / total_duration_wall
+                steps_per_sec = log_every / max(total_duration_wall, 1e-8)
 
                 log_parts = []
-
                 if log_level >= 1:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     log_parts.append(f"[{timestamp}]")
 
                 log_parts.append(f"Step {step:6d}")
                 log_parts.append(f"Avg Loss: {avg_loss:.5f}")
+                log_parts.append(f"Avg Similarity: {avg_similarity:5.2f}%")
                 log_parts.append(f"{steps_per_sec:.2f} steps/s")
 
-                print(f"\n{' | '.join(log_parts)}")
+                print("\n" + " | ".join(log_parts))
 
                 if log_level == 2:
-                    avg_data_time_ms = (acc_data_time / log_every) * 1000
-                    avg_forward_time_ms = (acc_forward_time / log_every) * 1000
-                    avg_backward_time_ms = (acc_backward_time / log_every) * 1000
-                    avg_optimizer_time_ms = (acc_optimizer_time / log_every) * 1000
+                    avg_data_time_ms = (acc_data_time / log_every) * 1000.0
+                    avg_forward_time_ms = (acc_forward_time / log_every) * 1000.0
+                    avg_backward_time_ms = (acc_backward_time / log_every) * 1000.0
+                    avg_optimizer_time_ms = (acc_optimizer_time / log_every) * 1000.0
 
-                    total_measured_ms = avg_data_time_ms + avg_forward_time_ms + avg_backward_time_ms + avg_optimizer_time_ms
+                    total_measured_ms = (
+                        avg_data_time_ms
+                        + avg_forward_time_ms
+                        + avg_backward_time_ms
+                        + avg_optimizer_time_ms
+                    )
 
                     print(f"  Average times per step (total measured: {total_measured_ms:.2f} ms):")
-
                     if total_measured_ms > 0:
                         print(
-                            f"    - Data Loading:       {avg_data_time_ms:8.2f} ms ({avg_data_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Data Loading:       {avg_data_time_ms:8.2f} ms ({avg_data_time_ms / total_measured_ms * 100:5.1f}%)"
+                        )
                         print(
-                            f"    - Forward Pass:       {avg_forward_time_ms:8.2f} ms ({avg_forward_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Forward Pass:       {avg_forward_time_ms:8.2f} ms ({avg_forward_time_ms / total_measured_ms * 100:5.1f}%)"
+                        )
                         print(
-                            f"    - Backward Pass:      {avg_backward_time_ms:8.2f} ms ({avg_backward_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Backward Pass:      {avg_backward_time_ms:8.2f} ms ({avg_backward_time_ms / total_measured_ms * 100:5.1f}%)"
+                        )
                         print(
-                            f"    - Optimizer/Update:   {avg_optimizer_time_ms:8.2f} ms ({avg_optimizer_time_ms / total_measured_ms * 100:5.1f}%)")
+                            f"    - Optimizer/Update:   {avg_optimizer_time_ms:8.2f} ms ({avg_optimizer_time_ms / total_measured_ms * 100:5.1f}%)"
+                        )
 
                 running_loss = 0.0
+                running_similarity = 0.0
                 last_log_time = current_time
 
-                if log_level == 2:
-                    acc_data_time = 0.0
-                    acc_forward_time = 0.0
-                    acc_backward_time = 0.0
-                    acc_optimizer_time = 0.0
+                acc_data_time = 0.0
+                acc_forward_time = 0.0
+                acc_backward_time = 0.0
+                acc_optimizer_time = 0.0
 
             if step % ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:06d}.pt"
                 save_checkpoint(ckpt_path, model, optimizer, step, epoch, scaler)
                 print(f"Saved checkpoint: {ckpt_path}")
 
-            if step >= max_steps:
-                break
-
             if log_level == 2:
                 data_start_time = time.monotonic()
+
         epoch += 1
 
     # Final save
@@ -284,8 +295,13 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
-    parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
-                        help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)")
+    parser.add_argument(
+        "--log_level",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)",
+    )
 
     args = parser.parse_args()
 

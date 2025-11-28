@@ -190,10 +190,86 @@ def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
 
 
 def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    # Load checkpoint safely; newer torch may support weights_only to avoid pickle execution
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    except TypeError:
+        # older torch doesn't have weights_only arg
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+
+    # Support checkpoints that store the state dict under the 'model' key or are the state dict directly
+    state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+
     n_sources = len(SOURCES)
     model = UNet1D(n_sources=n_sources, base=64)
-    model.load_state_dict(ckpt["model"])
+
+    # Try strict load first
+    try:
+        model.load_state_dict(state)
+        print("Checkpoint loaded (strict match).")
+    except RuntimeError as e:
+        print(f"Warning: strict state_dict load failed: {e}\nTrying to auto-remap keys to match current model...")
+        # Compute expected/present keys
+        expected_keys = set(model.state_dict().keys())
+        present_keys = set(state.keys()) if isinstance(state, dict) else set()
+        missing = expected_keys - present_keys
+        unexpected = present_keys - expected_keys
+
+        # Heuristic: try to map unexpected keys to missing keys by adjusting numeric tokens by +/-1
+        mapping = {}
+        for u in list(unexpected):
+            toks = u.split('.')
+            for idx, tok in enumerate(toks):
+                if tok.isdigit():
+                    for delta in (-1, 1):
+                        try:
+                            new_tok = str(int(tok) + delta)
+                        except Exception:
+                            continue
+                        new_toks = toks.copy()
+                        new_toks[idx] = new_tok
+                        cand = '.'.join(new_toks)
+                        if cand in missing:
+                            mapping[u] = cand
+                            break
+                # also try common case: replace '.2.'->'.1.', '.3.'->'.2.' etc by searching for numeric substrings
+                if any(char.isdigit() for char in tok) and tok != toks[idx]:
+                    pass
+                if u in mapping:
+                    break
+
+        if mapping:
+            print("Attempting auto-mapping of keys (this may fix small layer-index shifts):")
+            for k, v in mapping.items():
+                print(f"  {k} -> {v}")
+            # Apply mapping to a copy of state
+            new_state = dict(state)
+            for src_key, dst_key in mapping.items():
+                new_state[dst_key] = new_state[src_key]
+                del new_state[src_key]
+            # Try strict load with remapped keys
+            try:
+                model.load_state_dict(new_state)
+                print("Checkpoint loaded after auto-remapping (strict match).")
+            except Exception as e2:
+                print(f"Auto-remap didn't produce a strict match: {e2}\nFalling back to non-strict load (missing/unexpected keys will be ignored).")
+                load_res = model.load_state_dict(state, strict=False)
+                missing = getattr(load_res, "missing_keys", None) or (load_res.get("missing_keys") if isinstance(load_res, dict) else None)
+                unexpected = getattr(load_res, "unexpected_keys", None) or (load_res.get("unexpected_keys") if isinstance(load_res, dict) else None)
+                if missing:
+                    print("Missing keys when loading state_dict:", missing)
+                if unexpected:
+                    print("Unexpected keys in state_dict (ignored):", unexpected)
+        else:
+            print("No useful remapping found. Falling back to non-strict load (missing/unexpected keys will be ignored).")
+            load_res = model.load_state_dict(state, strict=False)
+            missing = getattr(load_res, "missing_keys", None) or (load_res.get("missing_keys") if isinstance(load_res, dict) else None)
+            unexpected = getattr(load_res, "unexpected_keys", None) or (load_res.get("unexpected_keys") if isinstance(load_res, dict) else None)
+            if missing:
+                print("Missing keys when loading state_dict:", missing)
+            if unexpected:
+                print("Unexpected keys in state_dict (ignored):", unexpected)
+
     model.to(device)
     model.eval()
     return model
