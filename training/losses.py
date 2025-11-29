@@ -22,7 +22,7 @@ def _flatten_bs(x: torch.Tensor) -> torch.Tensor:
         return x
 
 
-def si_sdr_loss(preds: torch.Tensor, targets: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def si_sdr_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     Negative SI-SDR loss (higher SI-SDR -> lower loss).
     preds, targets: (B, S, 1, L) or (B, S, L)
@@ -51,20 +51,8 @@ def l1_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(preds, targets)
 
 
-def _stft(x: torch.Tensor, n_fft: int, hop_length: int, win_length: int) -> torch.Tensor:
-    """Compute magnitude of STFT. x: (N, L) or (N, 1, L) -> (N, F, T) magnitude."""
-    if x.dim() == 3:
-        x = x.squeeze(1)
-    window = torch.hann_window(win_length, device=x.device, dtype=x.dtype)
-    X = torch.stft(x, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                   window=window, return_complex=True)
-    mag = X.abs()
-    return mag
-
-
 def mrstft_loss(preds: torch.Tensor, targets: torch.Tensor,
-                ffts: Iterable[Tuple[int, int, int]] | None = None,
-                eps: float = 1e-7) -> torch.Tensor:
+                ffts: Iterable[Tuple[int, int, int]] | None = None) -> torch.Tensor:
     """
     Multi-resolution STFT loss: sum of spectral convergence and log-magnitude L1 across resolutions.
     preds, targets: (B, S, 1, L)
@@ -117,14 +105,4 @@ def get_loss_fn(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tenso
         def _hybrid(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             return 0.5 * si_sdr_loss(preds, targets) + 0.5 * l1_loss(preds, targets)
         return _hybrid
-    if name == 'combo':
-        def _combo(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            # SI-SDR plus MRSTFT; weights chosen conservatively
-            return si_sdr_loss(preds, targets) + 0.1 * mrstft_loss(preds, targets)
-        return _combo
-    if name in ('perceptual', 'si_sdr_l1_mrstft'):
-        def _perceptual(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            # Balanced mix for stable training + perceptual quality
-            return si_sdr_loss(preds, targets) + 0.5 * l1_loss(preds, targets) + 0.2 * mrstft_loss(preds, targets)
-        return _perceptual
     raise ValueError(f"Unknown loss name: {name}. Choose from: l1, si_sdr, mrstft, si_sdr_l1, combo, perceptual")
