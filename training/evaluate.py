@@ -1,8 +1,15 @@
+import warnings
 import torch
 from torch.utils.data import DataLoader
 
 from training.data import MusdbRandomChunks
 from training.model import apply_masks
+from training import losses
+
+try:
+    import mir_eval.separation as mir_eval_sep
+except Exception:
+    mir_eval_sep = None
 
 
 @torch.no_grad()
@@ -20,37 +27,69 @@ def compute_sdr_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
             - "sdr": mean SDR over batch and sources [dB]
             - "si_sdr": mean scale-invariant SDR over batch and sources [dB]
     """
-    # Make sure time dimensions match
-    L = min(preds.shape[-1], targets.shape[-1])
+    sdr_val = losses.sdr(preds, targets, reduction="mean")
+    si_sdr_val = losses.si_sdr(preds, targets, reduction="mean")
+
+    return {
+        "sdr": float(sdr_val.item() if torch.is_tensor(sdr_val) else sdr_val),
+        "si_sdr": float(si_sdr_val.item() if torch.is_tensor(si_sdr_val) else si_sdr_val),
+    }
+
+
+@torch.no_grad()
+def compute_bss_metrics(preds: torch.Tensor, targets: torch.Tensor) -> dict:
+    """Compute BSS Eval metrics (SDR, SIR, SAR) using mir_eval.
+
+    Args:
+        preds, targets: tensors of shape (B, S, 1, L) or (B, S, L).
+
+    Returns:
+        dict with keys 'sdr', 'sir', 'sar' containing the mean over batch and sources.
+
+    Notes:
+        Requires `mir_eval` to be installed. If not available, raises ImportError with guidance.
+    """
+    if mir_eval_sep is None:
+        raise ImportError("mir_eval is required for BSS Eval metrics. Install it with: pip install mir_eval")
+
+    # Align shapes and time length
+    if preds.dim() == 4:
+        preds = preds.squeeze(2)
+    if targets.dim() == 4:
+        targets = targets.squeeze(2)
+
+    B, S, Lp = preds.shape
+    _, _, Lt = targets.shape
+    L = min(Lp, Lt)
     preds = preds[..., :L]
     targets = targets[..., :L]
 
-    # (B, S, 1, L) -> (B*S, L)
-    B, S, C, L = preds.shape
-    preds_f = preds.reshape(B * S, L)
-    targets_f = targets.reshape(B * S, L)
+    total_sdr = 0.0
+    total_sir = 0.0
+    total_sar = 0.0
+    n_items = 0
 
-    # Standard SDR: 10 * log10( ||s||^2 / ||s - s_hat||^2 )
-    eps = 1e-8
-    num = (targets_f ** 2).sum(dim=-1)
-    den = ((targets_f - preds_f) ** 2).sum(dim=-1) + eps
-    sdr = 10.0 * torch.log10(num / den + eps)
+    # mir_eval expects shape (nsrc, nsamples) as numpy arrays
+    for b in range(B):
+        # (S, L)
+        est = preds[b].detach().cpu().numpy()
+        ref = targets[b].detach().cpu().numpy()
 
-    # SI-SDR (scale-invariant SDR)
-    # proj = <s_hat, s> / ||s||^2 * s
-    dot = (preds_f * targets_f).sum(dim=-1)
-    s_target_energy = (targets_f ** 2).sum(dim=-1) + eps
-    scale = dot / s_target_energy
-    proj = scale.unsqueeze(-1) * targets_f
-    e_noise = preds_f - proj
-    si_num = (proj ** 2).sum(dim=-1)
-    si_den = (e_noise ** 2).sum(dim=-1) + eps
-    si_sdr = 10.0 * torch.log10(si_num / si_den + eps)
+        # Ensure arrays are (nsrc, nsamples)
+        # mir_eval.bss_eval_sources returns (sdr, sir, sar, perm)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            sdr, sir, sar, _ = mir_eval_sep.bss_eval_sources(ref, est)
 
-    return {
-        "sdr": sdr.mean().item(),
-        "si_sdr": si_sdr.mean().item(),
-    }
+        total_sdr += float(sdr.mean())
+        total_sir += float(sir.mean())
+        total_sar += float(sar.mean())
+        n_items += 1
+
+    if n_items == 0:
+        return {"sdr": float("nan"), "sir": float("nan"), "sar": float("nan")}
+
+    return {"sdr": total_sdr / n_items, "sir": total_sir / n_items, "sar": total_sar / n_items}
 
 
 def evaluate(
