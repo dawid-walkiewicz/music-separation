@@ -1,17 +1,6 @@
-from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def _match_time(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Trim both tensors to a common (minimum) length along the time axis."""
-    L = min(a.shape[-1], b.shape[-1])
-    if a.shape[-1] != L:
-        a = a[..., :L]
-    if b.shape[-1] != L:
-        b = b[..., :L]
-    return a, b
 
 
 class ConvBlock(nn.Module):
@@ -48,7 +37,11 @@ class UNet1D(nn.Module):
         self.d3 = nn.Conv1d(ch * 4, ch * 4, 4, 2, 1)
 
         # Bottleneck
-        self.b = nn.Sequential(ConvBlock(ch * 4, ch * 8), ConvBlock(ch * 8, ch * 8))
+        self.b = nn.Sequential(
+            ConvBlock(ch * 4, ch * 8),
+            nn.Dropout(0.2),
+            ConvBlock(ch * 8, ch * 8),
+        )
 
         # Decoder
         self.u3 = nn.ConvTranspose1d(ch * 8, ch * 4, 4, 2, 1)
@@ -62,7 +55,16 @@ class UNet1D(nn.Module):
 
         # Output masks
         self.out = nn.Conv1d(ch, n_sources, 1)
-        self.act_out = nn.Sigmoid()  # masks in [0,1]
+        self.act_out = nn.Softmax(dim=1)  # masks in [0,1]
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, mixture: torch.Tensor) -> torch.Tensor:
         # mixture: (B, C=1, L)
@@ -72,17 +74,15 @@ class UNet1D(nn.Module):
         xb = self.b(F.leaky_relu(self.d3(x3), 0.1))   # (B, 8ch, L/8)
 
         y3 = self.u3(xb)  # (B, 4ch, ~L/4)
-        y3, x3 = _match_time(y3, x3)
+
         y3 = torch.cat([y3, x3], dim=1)
         y3 = self.p3(y3)
 
         y2 = self.u2(y3)  # (B, 2ch, ~L/2)
-        y2, x2 = _match_time(y2, x2)
         y2 = torch.cat([y2, x2], dim=1)
         y2 = self.p2(y2)
 
         y1 = self.u1(y2)  # (B, ch, ~L)
-        y1, x1 = _match_time(y1, x1)
         y1 = torch.cat([y1, x1], dim=1)
         y1 = self.p1(y1)
 
