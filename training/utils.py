@@ -8,8 +8,8 @@ def save_checkpoint(
         path: Path,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        step: int,
         epoch: int,
+        step: int,
         scaler: torch.cuda.amp.GradScaler | None,
         extra: Dict | None = None,
 ):
@@ -18,8 +18,8 @@ def save_checkpoint(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "step": step,
             "epoch": epoch,
+            "step": step,
             "scaler": scaler.state_dict() if scaler is not None else None,
             "extra": extra or {},
         },
@@ -37,9 +37,9 @@ def load_checkpoint(path: Path,
         optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
-    step = int(ckpt.get("step", 0))
     epoch = int(ckpt.get("epoch", 0))
-    return step, epoch
+    step = int(ckpt.get("step", 0))
+    return epoch, step
 
 
 def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:
