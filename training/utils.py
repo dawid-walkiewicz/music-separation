@@ -22,6 +22,7 @@ def save_checkpoint(
             "step": step,
             "scaler": scaler.state_dict() if scaler is not None else None,
             "extra": extra or {},
+            "ema": extra.get("ema") if extra else None,
         },
         str(path),
     )
@@ -39,7 +40,7 @@ def load_checkpoint(path: Path,
         scaler.load_state_dict(ckpt["scaler"])
     epoch = int(ckpt.get("epoch", 0))
     step = int(ckpt.get("step", 0))
-    return epoch, step
+    return epoch, step, ckpt.get("ema")
 
 
 def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:

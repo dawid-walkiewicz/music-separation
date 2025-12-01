@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Local imports
-from training.model import UNet1D, apply_masks
+from training.model import HybridTimeFreqUNet, apply_masks
 
 # Try backends for audio IO
 _have_soundfile = False
@@ -189,7 +189,7 @@ def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
     raise RuntimeError("No audio backend available for writing: install soundfile or torchaudio")
 
 
-def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
+def load_model_from_ckpt(ckpt_path: Path, device: torch.device, use_ema: bool = False):
     # Load checkpoint safely; newer torch may support weights_only to avoid pickle execution
     try:
         ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
@@ -199,9 +199,19 @@ def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
 
     # Support checkpoints that store the state dict under the 'model' key or are the state dict directly
     state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+    ema_state = ckpt.get("ema") if isinstance(ckpt, dict) else None
+    if use_ema and isinstance(ema_state, dict) and ema_state.get("shadow"):
+        state = ema_state["shadow"]
+        print("Using EMA shadow weights for inference.")
 
     n_sources = len(SOURCES)
-    model = UNet1D(n_sources=n_sources, base=64)
+    model = HybridTimeFreqUNet(
+        n_sources=n_sources,
+        base_time=128,
+        base_freq=64,
+        n_fft=2048,
+        hop_length=512,
+    )
 
     # Try strict load first
     try:
@@ -328,6 +338,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--chunk_seconds", type=float, default=8.0, help="Chunk length in seconds for inference")
     parser.add_argument("--overlap_seconds", type=float, default=1.0, help="Overlap between chunks in seconds")
     parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision on CUDA to reduce risk of NaNs")
+    parser.add_argument("--use_ema", action="store_true", help="Load EMA shadow weights if checkpoint stores them")
     args = parser.parse_args(argv)
 
     ckpt_path = Path(args.ckpt)
@@ -343,7 +354,7 @@ def main(argv: list[str] | None = None):
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = load_model_from_ckpt(ckpt_path, device)
+    model = load_model_from_ckpt(ckpt_path, device, use_ema=args.use_ema)
     use_amp = (not args.no_amp)
     process_input(model, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
 

@@ -100,6 +100,7 @@ def evaluate(
     segment_seconds: float,
     device: torch.device,
     max_batches: int = 20,
+    num_workers: int = 0,
 ) -> dict:
     """Run a quick benchmark on random chunks from the MUSDB18 test subset.
 
@@ -119,14 +120,16 @@ def evaluate(
 
     loader_val = DataLoader(
         dataset_val,
-        batch_size=1,  # same as training: mixture (B=1, C=1, L)
-        num_workers=0,
+        batch_size=1,
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
     total_sdr = 0.0
     total_si_sdr = 0.0
     n = 0
+    bss_stats = {"sdr": 0.0, "sir": 0.0, "sar": 0.0}
+    mir_eval_available = mir_eval_sep is not None
 
     model.eval()
 
@@ -145,6 +148,14 @@ def evaluate(
         metrics = compute_sdr_metrics(preds, targets)
         total_sdr += metrics["sdr"]
         total_si_sdr += metrics["si_sdr"]
+        if mir_eval_available:
+            try:
+                bss = compute_bss_metrics(preds, targets)
+                for k in bss_stats:
+                    bss_stats[k] += bss[k]
+            except Exception as exc:
+                print(f"Warning: compute_bss_metrics failed on batch {i}: {exc}")
+                mir_eval_available = False
         n += 1
 
     model.train()
@@ -152,4 +163,7 @@ def evaluate(
     if n == 0:
         return {"sdr": float("nan"), "si_sdr": float("nan")}
 
-    return {"sdr": total_sdr / n, "si_sdr": total_si_sdr / n}
+    result = {"sdr": total_sdr / n, "si_sdr": total_si_sdr / n}
+    if bss_stats["sdr"] != 0 or bss_stats["sir"] != 0 or bss_stats["sar"] != 0:
+        result.update({k: v / n for k, v in bss_stats.items()})
+    return result

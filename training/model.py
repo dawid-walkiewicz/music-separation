@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 class ConvBlock(nn.Module):
@@ -90,6 +91,12 @@ class UNet1D(nn.Module):
         return masks
 
 
+def _match_time(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Crop tensors along the time axis so they share the same length."""
+    L = min(a.shape[-1], b.shape[-1])
+    return a[..., :L], b[..., :L]
+
+
 def apply_masks(mixture: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
     """Apply masks to mixture to obtain separated sources.
 
@@ -97,9 +104,7 @@ def apply_masks(mixture: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
     masks:   (B, S, Lm)
     -> sources: (B, S, 1, Lc) where Lc = min(L, Lm)
     """
-    Lc = min(mixture.shape[-1], masks.shape[-1])
-    mixture = mixture[..., :Lc]
-    masks = masks[..., :Lc]
+    mixture, masks = _match_time(mixture, masks)
     return masks.unsqueeze(2) * mixture.unsqueeze(1)
 
 
@@ -162,11 +167,13 @@ class HybridTimeFreqUNet(nn.Module):
         base_freq: int = 64,
         n_fft: int = 2048,
         hop_length: int = 512,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.n_sources = n_sources
         self.n_fft = n_fft
         self.hop_length = hop_length
+        self.use_checkpoint = use_checkpoint and grad_checkpoint is not None
 
         self.time_net = UNet1D(n_sources=n_sources, base=base_time)
         self.freq_branch = FreqBranch(in_ch=1, base=base_freq, out_ch=base_freq)
@@ -178,12 +185,17 @@ class HybridTimeFreqUNet(nn.Module):
         # Cached Hann window for STFT; automatically moved to correct device
         self.register_buffer("stft_window", torch.hann_window(self.n_fft))
 
+    def _maybe_checkpoint(self, module: nn.Module, *args: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint and self.training:
+            return grad_checkpoint(module, *args)
+        return module(*args)
+
     def forward(self, mixture: torch.Tensor) -> torch.Tensor:
         # mixture: (B, 1, L)
         B, C, L = mixture.shape
 
         # 1) Time-domain branch
-        masks_time = self.time_net(mixture)  # (B, S, Lt)
+        masks_time = self._maybe_checkpoint(self.time_net, mixture)  # (B, S, Lt)
 
         # 2) Frequency-domain branch via STFT
         wav = mixture.squeeze(1)  # (B, L)
@@ -197,7 +209,7 @@ class HybridTimeFreqUNet(nn.Module):
         )  # (B, F, T)
         mag = spec.abs().unsqueeze(1)  # (B, 1, F, T)
 
-        freq_feats = self.freq_branch(mag)  # (B, base_freq, T')
+        freq_feats = self._maybe_checkpoint(self.freq_branch, mag)  # (B, base_freq, T')
 
         # 3) Match time length: interpolate frequency features to Lt
         Lt = masks_time.shape[-1]
@@ -248,3 +260,5 @@ def similarity_percent(preds: torch.Tensor, targets: torch.Tensor) -> float:
 
     sim = torch.clamp(1.0 - error / var, 0.0, 1.0) * 100.0
     return float(sim.item())
+
+

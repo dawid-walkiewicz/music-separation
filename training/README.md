@@ -41,7 +41,7 @@ Kontrakty danych (kształty tensorów):
 - Używa `musdb` i `stempeg`, czyta źródła utworu (vocals, drums, bass, other).
 - Każdy przykład to losowy start w utworze i wycinek o długości `segment_seconds`.
 - Normalizuje dane do układu `(C, L)` (kanały, długość) i konwertuje na `float32`.
-- Wariant mono: kanały stereo są uśredniane do jednego kanału (C=1) – to upraszcza model i zmniejsza RAM/VRAM.
+- Wariant mono: kanały stereo są uśredniane do jednego kanała (C=1) – to upraszcza model i zmniejsza RAM/VRAM.
 - Miks = suma czterech źródeł w domenie czasu: `mixture = sum(sources)`.
 
 ### `model.py` (1D U-Net + maski)
@@ -191,3 +191,10 @@ Jeśli chcesz, mogę dodać skrypt `infer.py`, który:
 - zresampluje do 44.1 kHz mono,
 - zapisze 4 rozdzielone ścieżki WAV do wybranego katalogu.
 
+---
+
+## Dodatkowe informacje o stratach
+
+- `auraloss>=0.4.0` (required for the optional Multi-Resolution STFT loss `--loss mrstft`)
+
+> **Note:** If you choose `--loss mrstft` without installing `auraloss`, training will emit "Warning: auraloss package not found" and fall back to the other losses. Run `pip install auraloss` first to silence it.

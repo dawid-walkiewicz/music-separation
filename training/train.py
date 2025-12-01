@@ -46,6 +46,26 @@ class EMA:
             if name in self.buffers:
                 buf.copy_(self.buffers[name])
 
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": {k: v.detach().clone() for k, v in self.shadow.items()},
+            "buffers": {k: v.detach().clone() for k, v in self.buffers.items()},
+        }
+
+    def load_state_dict(self, state: dict | None):
+        if not state:
+            return
+        self.decay = state.get("decay", self.decay)
+        shadow = state.get("shadow", {})
+        buffers = state.get("buffers", {})
+        for name, tensor in shadow.items():
+            if name in self.shadow:
+                self.shadow[name].copy_(tensor)
+        for name, tensor in buffers.items():
+            if name in self.buffers:
+                self.buffers[name].copy_(tensor)
+
 
 def seed_worker(worker_id):
     """
@@ -87,6 +107,9 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
         targets_c = targets[..., :Lp]  # match length
         loss = loss_fn(preds, targets_c)
 
+    with torch.no_grad():
+        sim = similarity_percent(preds.detach(), targets_c.detach())
+
     if use_cuda and log_level == 2:
         torch.cuda.synchronize()
 
@@ -113,11 +136,12 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
     if log_level == 2:
         times["optim"] = time.monotonic() - start
 
-    return float(loss.item()), times
+    return float(loss.item()), float(sim), times
 
 
-def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time):
+def log_status(epoch, running_loss, running_similarity, log_times, log_every, log_level, epoch_size, last_log_time):
     avg_loss = running_loss / (log_every * epoch_size)
+    avg_sim = running_similarity / (log_every * epoch_size)
 
     current_time = time.monotonic()
     total_duration_wall = current_time - last_log_time
@@ -131,6 +155,7 @@ def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size,
 
     log_parts.append(f"Epoch {epoch:6d}")
     log_parts.append(f"Avg Loss: {avg_loss:.5f}")
+    log_parts.append(f"Avg Similarity: {avg_sim:5.2f}%")
     log_parts.append(f"{steps_per_sec:.2f} steps/s")
 
     print(f"\n{' | '.join(log_parts)}")
@@ -147,7 +172,7 @@ def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size,
     return current_time
 
 
-def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds):
+def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds, max_batches=20, eval_num_workers=0):
     print("\n[Eval] Copying EMA weights and computing metrics on the validation set...")
 
     backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -159,7 +184,8 @@ def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment
         sources=sources,
         segment_seconds=segment_seconds,
         device=device,
-        max_batches=20,
+        max_batches=max_batches,
+        num_workers=eval_num_workers,
     )
     model.load_state_dict(backup)
     print(f"[Eval] Epoch {epoch:6d} | SDR: {metrics['sdr']:.2f} dB | SI-SDR: {metrics['si_sdr']:.2f} dB")
@@ -184,6 +210,10 @@ def train(
         log_level: int = 0,
         loss_name: str = "si_sdr_l1",
         eval_every: int = 5,
+        items_per_epoch: int = 10_000,
+        eval_batches: int = 20,
+        use_checkpoint: bool = False,
+        eval_num_workers: int = 0,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -203,7 +233,7 @@ def train(
         subset="train",
         sources=list(sources),
         segment_seconds=segment_seconds,
-        items_per_epoch=10_000,
+        items_per_epoch=items_per_epoch,
         mono=True,
         seed=seed,
     )
@@ -229,6 +259,7 @@ def train(
         base_freq=64,
         n_fft=2048,
         hop_length=512,
+        use_checkpoint=use_checkpoint,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler(enabled=use_cuda)
@@ -256,7 +287,8 @@ def train(
                 print(f"Warning: {ckpt_path} not found, starting from scratch.")
                 ckpt_path = None
         if ckpt_path is not None:
-            start_epoch, step = load_checkpoint(ckpt_path, model, optimizer, scaler)
+            start_epoch, step, ema_state = load_checkpoint(ckpt_path, model, optimizer, scaler)
+            ema.load_state_dict(ema_state)
             print(f"Resumed from: {ckpt_path} | epoch={start_epoch}")
 
     running_loss = 0.0
@@ -270,8 +302,9 @@ def train(
         for i, batch in enumerate(loader, start=1):
             step += 1
 
-            loss, t = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level)
+            loss, sim, t = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level)
             running_loss += loss
+            running_similarity += sim
 
             if log_level == 2:
                 for key in log_times.keys():
@@ -281,27 +314,29 @@ def train(
                 break
 
         if epoch % log_every == 0:
-            last_log_time = log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time)
+            last_log_time = log_status(epoch, running_loss, running_similarity, log_times, log_every, log_level, epoch_size, last_log_time)
             running_loss = 0.0
             running_similarity = 0.0
             log_times = {k: 0.0 for k in log_times}
 
         if epoch % eval_every == 0:
-            metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds)
+            metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds, max_batches=eval_batches, eval_num_workers=eval_num_workers)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             if metrics["si_sdr"] > best_si_sdr:
                 best_si_sdr = metrics["si_sdr"]
                 best_ckpt = ckpt_dir / "best_sisdr.pt"
-                save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler)
+                save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler, extra={"ema": ema.state_dict()})
                 print(f"[Eval] New best model (SI-SDR={best_si_sdr:.2f} dB) has been saved to {best_ckpt}")
 
         if epoch % ckpt_every == 0:
             path = ckpt_dir / f"epoch_{epoch:04d}.pt"
-            save_checkpoint(path, model, optimizer, epoch, step, scaler)
+            save_checkpoint(path, model, optimizer, epoch, step, scaler, extra={"ema": ema.state_dict()})
             print(f"[CKPT] Saved checkpoint: {path}")
 
     # Final save
     ckpt_path = ckpt_dir / f"final_step_{step:06d}.pt"
-    save_checkpoint(ckpt_path, model, optimizer, epoch, step, scaler)
+    save_checkpoint(ckpt_path, model, optimizer, epoch, step, scaler, extra={"ema": ema.state_dict()})
     print(f"Saved final checkpoint: {ckpt_path}")
 
 
@@ -317,7 +352,7 @@ if __name__ == "__main__":
         choices=["wav", "stem"],
         help="Input data format for MUSDB18: 'wav' (default) or 'stem'.",
     )
-    parser.add_argument("--workdir", type=str, default="./runs/unet1d")
+    parser.add_argument("--workdir", type=str, default="./runs/hybrid_unet")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=400, help="Number of epochs to train")
@@ -326,6 +361,9 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_every", type=int, default=10, help="Save checkpoint every N epochs")
     parser.add_argument("--segment_seconds", type=float, default=6.0, help="Segment length in seconds")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of DataLoader workers")
+    parser.add_argument("--items_per_epoch", type=int, default=10_000, help="Synthetic epoch size for MusdbRandomChunks")
+    parser.add_argument("--eval_batches", type=int, default=20, help="Number of validation batches during eval")
+    parser.add_argument("--eval_num_workers", type=int, default=0, help="DataLoader workers for evaluation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
     parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
@@ -334,6 +372,7 @@ if __name__ == "__main__":
                         choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
                         help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
+    parser.add_argument("--use_checkpoint", action="store_true", help="Enable checkpointing in the model")
 
     args = parser.parse_args()
 
@@ -356,4 +395,8 @@ if __name__ == "__main__":
         log_level=args.log_level,
         loss_name=args.loss,
         eval_every=args.eval_every,
+        items_per_epoch=args.items_per_epoch,
+        eval_batches=args.eval_batches,
+        use_checkpoint=args.use_checkpoint,
+        eval_num_workers=args.eval_num_workers,
     )
