@@ -9,15 +9,27 @@ warnings.filterwarnings(
 )
 
 
+def _conv_out_length(length: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1) -> int:
+    numerator = length + 2 * padding - dilation * (kernel_size - 1) - 1
+    return (numerator // stride) + 1
+
+
+def _group_norm(channels: int, max_groups: int = 8) -> nn.GroupNorm:
+    groups = min(max_groups, channels)
+    while channels % groups != 0 and groups > 1:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
         super().__init__()
         self.conv = nn.Conv1d(in_ch, out_ch, k, s, p)
-        self.bn = nn.BatchNorm1d(out_ch)
+        self.norm = _group_norm(out_ch)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
+        return self.act(self.norm(self.conv(x)))
 
 
 class UNet1D(nn.Module):
@@ -50,24 +62,32 @@ class UNet1D(nn.Module):
         )
 
         # Decoder
-        self.u3 = nn.ConvTranspose1d(ch * 8, ch * 4, 4, 2, 1)
+        self.u3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="linear", align_corners=False),
+            nn.Conv1d(ch * 8, ch * 4, kernel_size=3, padding=1),
+        )
         self.p3 = nn.Sequential(ConvBlock(ch * 8, ch * 4), ConvBlock(ch * 4, ch * 4))
 
-        self.u2 = nn.ConvTranspose1d(ch * 4, ch * 2, 4, 2, 1)
+        self.u2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="linear", align_corners=False),
+            nn.Conv1d(ch * 4, ch * 2, kernel_size=3, padding=1),
+        )
         self.p2 = nn.Sequential(ConvBlock(ch * 4, ch * 2), ConvBlock(ch * 2, ch * 2))
 
-        self.u1 = nn.ConvTranspose1d(ch * 2, ch, 4, 2, 1)
+        self.u1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="linear", align_corners=False),
+            nn.Conv1d(ch * 2, ch, kernel_size=3, padding=1),
+        )
         self.p1 = nn.Sequential(ConvBlock(ch * 2, ch), ConvBlock(ch, ch))
 
         # Output masks
         self.out = nn.Conv1d(ch, n_sources, 1)
-        self.act_out = nn.Softmax(dim=1)  # masks in [0,1]
 
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
+            if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -80,20 +100,22 @@ class UNet1D(nn.Module):
         xb = self.b(F.leaky_relu(self.d3(x3), 0.1))   # (B, 8ch, L/8)
 
         y3 = self.u3(xb)  # (B, 4ch, ~L/4)
-
+        y3, x3 = _match_time(y3, x3)
         y3 = torch.cat([y3, x3], dim=1)
         y3 = self.p3(y3)
 
         y2 = self.u2(y3)  # (B, 2ch, ~L/2)
+        y2, x2 = _match_time(y2, x2)
         y2 = torch.cat([y2, x2], dim=1)
         y2 = self.p2(y2)
 
         y1 = self.u1(y2)  # (B, ch, ~L)
+        y1, x1 = _match_time(y1, x1)
         y1 = torch.cat([y1, x1], dim=1)
         y1 = self.p1(y1)
 
-        masks = self.act_out(self.out(y1))  # (B, S, ~L)
-        return masks
+        logits = self.out(y1)  # (B, S, ~L)
+        return logits
 
 
 def _match_time(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -120,26 +142,36 @@ class FreqBranch(nn.Module):
     Output: 1D time features (B, C, T) after pooling over frequency.
     """
 
-    def __init__(self, in_ch: int = 1, base: int = 32, out_ch: int | None = None):
+    def __init__(self, in_ch: int = 1, base: int = 32, out_ch: int | None = None, freq_bins: int | None = None):
         super().__init__()
         if out_ch is None:
             out_ch = base
+        if freq_bins is None:
+            raise ValueError("FreqBranch requires 'freq_bins' (STFT bins) to preserve frequency structure.")
+        self.freq_bins = freq_bins
         self.enc1 = nn.Sequential(
             nn.Conv2d(in_ch, base, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base),
+            _group_norm(base),
             nn.ReLU(inplace=True),
         )
         self.enc2 = nn.Sequential(
             nn.Conv2d(base, base * 2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base * 2),
+            _group_norm(base * 2),
             nn.ReLU(inplace=True),
         )
         self.enc3 = nn.Sequential(
             nn.Conv2d(base * 2, base * 4, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base * 4),
+            _group_norm(base * 4),
             nn.ReLU(inplace=True),
         )
         self.proj = nn.Conv2d(base * 4, out_ch, kernel_size=1)
+        reduced_bins = _conv_out_length(
+            _conv_out_length(freq_bins, kernel_size=3, stride=2, padding=1),
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+        self.post_flatten = nn.Conv1d(out_ch * reduced_bins, out_ch, kernel_size=1)
 
     def forward(self, spec_mag: torch.Tensor) -> torch.Tensor:
         # spec_mag: (B, 1, F, T)
@@ -147,8 +179,9 @@ class FreqBranch(nn.Module):
         x = self.enc2(x)
         x = self.enc3(x)  # (B, C, F', T')
         x = self.proj(x)  # (B, out_ch, F', T')
-        # global pooling over frequency F'
-        x = x.mean(dim=2)  # (B, out_ch, T')
+        B, C, Fp, T = x.shape
+        x = x.reshape(B, C * Fp, T)
+        x = self.post_flatten(x)
         return x
 
 
@@ -181,7 +214,14 @@ class HybridTimeFreqUNet(nn.Module):
         self.use_checkpoint = use_checkpoint and grad_checkpoint is not None
 
         self.time_net = UNet1D(n_sources=n_sources, base=base_time)
-        self.freq_branch = FreqBranch(in_ch=1, base=base_freq, out_ch=base_freq)
+        self.freq_branch = FreqBranch(
+            in_ch=1,
+            base=base_freq,
+            out_ch=base_freq,
+            freq_bins=(self.n_fft // 2) + 1,
+        )
+        self.freq_norm = nn.LayerNorm(base_freq)
+        self.fuse_norm = nn.LayerNorm(n_sources + base_freq)
 
         # Fusion layer: concatenates time-domain masks (S channels)
         # with frequency-domain features (base_freq channels)
@@ -203,7 +243,7 @@ class HybridTimeFreqUNet(nn.Module):
         B, C, L = mixture.shape
 
         # 1) Time-domain branch
-        masks_time = self._maybe_checkpoint(self.time_net, mixture)  # (B, S, Lt)
+        masks_time_logits = self._maybe_checkpoint(self.time_net, mixture)  # (B, S, Lt)
 
         # 2) Frequency-domain branch via STFT
         wav = mixture.squeeze(1)  # (B, L)
@@ -216,16 +256,22 @@ class HybridTimeFreqUNet(nn.Module):
             return_complex=True,
         )  # (B, F, T)
         mag = spec.abs().unsqueeze(1)  # (B, 1, F, T)
+        mag = torch.log1p(mag + 1e-7)
+        assert not torch.isnan(mag).any(), "NaNs detected after log compression"
 
         freq_feats = self._maybe_checkpoint(self.freq_branch, mag)  # (B, base_freq, T')
+        freq_feats = self.freq_norm(freq_feats.transpose(1, 2)).transpose(1, 2)
 
         # 3) Match time length: interpolate frequency features to Lt
-        Lt = masks_time.shape[-1]
-        freq_feats_up = F.interpolate(freq_feats, size=Lt, mode="linear", align_corners=False)
+        Lt = masks_time_logits.shape[-1]
+        freq_feats_up = F.interpolate(freq_feats, size=Lt, mode="nearest")
 
         # 4) Fusion and final masks
-        x = torch.cat([masks_time, freq_feats_up], dim=1)  # (B, S+base_freq, Lt)
-        masks = torch.sigmoid(self.fuse_conv(x))  # (B, S, Lt)
+        x = torch.cat([masks_time_logits, freq_feats_up], dim=1)  # (B, S+base_freq, Lt)
+        x = self.fuse_norm(x.transpose(1, 2)).transpose(1, 2)
+        logits = self.fuse_conv(x) + masks_time_logits
+        masks = F.relu(logits)
+        masks = torch.clamp(masks, min=1e-4)
         return masks
 
 
@@ -268,5 +314,3 @@ def similarity_percent(preds: torch.Tensor, targets: torch.Tensor) -> float:
 
     sim = torch.clamp(1.0 - error / var, 0.0, 1.0) * 100.0
     return float(sim.item())
-
-

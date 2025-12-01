@@ -1,4 +1,5 @@
 from typing import Callable, Iterable, Tuple, Optional
+import itertools
 
 import torch
 import torch.nn.functional as F
@@ -175,6 +176,22 @@ def mrstft_loss(preds: torch.Tensor, targets: torch.Tensor,
     return loss
 
 
+def composite_sisdr_mrstft(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    sisdr = si_sdr_loss(preds, targets)
+    mrstft = mrstft_loss(preds, targets)
+    return 0.8 * sisdr + 0.2 * mrstft
+
+
+def apply_pit(loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor], preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    B, S = preds.shape[:2]
+    perms = list(itertools.permutations(range(S)))
+    losses = []
+    for perm in perms:
+        permuted = preds[:, list(perm), ...]
+        losses.append(loss_fn(permuted, targets))
+    return torch.stack(losses, dim=0).min()
+
+
 def get_loss_fn(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return a loss function by name. The returned callable accepts (preds, targets) and
     returns a scalar tensor suitable for training.
@@ -186,8 +203,10 @@ def get_loss_fn(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tenso
         return si_sdr_loss
     if name == 'mrstft':
         return mrstft_loss
+    if name == 'si_sdr_mrstft':
+        return composite_sisdr_mrstft
     if name in ('si_sdr_l1', 'hybrid'):
         def _hybrid(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             return 0.5 * si_sdr_loss(preds, targets) + 0.5 * l1_loss(preds, targets, reduction="mean")
         return _hybrid
-    raise ValueError(f"Unknown loss name: {name}. Choose from: l1, si_sdr, mrstft, si_sdr_l1, hybrid")
+    raise ValueError(f"Unknown loss name: {name}. Choose from: l1, si_sdr, mrstft, si_sdr_l1, hybrid, si_sdr_mrstft")

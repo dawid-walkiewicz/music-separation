@@ -5,6 +5,30 @@ import sys
 import torch
 import numpy as np
 
+try:
+    import soundfile as sf
+    _have_soundfile = True
+except ImportError:
+    _have_soundfile = False
+
+try:
+    import torchaudio
+    _have_torchaudio = True
+except ImportError:
+    _have_torchaudio = False
+
+try:
+    import resampy
+    _have_resampy = True
+except ImportError:
+    _have_resampy = False
+
+try:
+    import stempeg
+    _have_stempeg = True
+except ImportError:
+    _have_stempeg = False
+
 # Ensure project root on sys.path for 'training' imports
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -13,35 +37,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # Local imports
 from training.model import HybridTimeFreqUNet, apply_masks
 
-# Try backends for audio IO
-_have_soundfile = False
-_have_torchaudio = False
-_have_resampy = False
-_have_stempeg = False
-try:
-    import soundfile as sf
-    _have_soundfile = True
-except Exception:
-    pass
-try:
-    import torchaudio
-    _have_torchaudio = True
-except Exception:
-    pass
-try:
-    import resampy
-    _have_resampy = True
-except Exception:
-    pass
-try:
-    import stempeg
-    _have_stempeg = True
-except Exception:
-    pass
-
+DEFAULT_SOURCES = ("vocals", "drums", "bass", "other")
 
 TARGET_SR = 44100
-SOURCES = ("vocals", "drums", "bass", "other")
+SOURCES = DEFAULT_SOURCES
 
 
 def _resample_np_mono(wave_mono: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
@@ -189,7 +188,10 @@ def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
     raise RuntimeError("No audio backend available for writing: install soundfile or torchaudio")
 
 
-def load_model_from_ckpt(ckpt_path: Path, device: torch.device, use_ema: bool = False):
+def load_model_from_ckpt(ckpt_path: Path, device: torch.device, use_ema: bool = False,
+                        base_time: int = 128, base_freq: int = 64,
+                        n_fft: int = 2048, hop_length: int = 512,
+                        sources: tuple[str, ...] = DEFAULT_SOURCES):
     # Load checkpoint safely; newer torch may support weights_only to avoid pickle execution
     try:
         ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
@@ -204,13 +206,13 @@ def load_model_from_ckpt(ckpt_path: Path, device: torch.device, use_ema: bool = 
         state = ema_state["shadow"]
         print("Using EMA shadow weights for inference.")
 
-    n_sources = len(SOURCES)
+    n_sources = len(sources)
     model = HybridTimeFreqUNet(
         n_sources=n_sources,
-        base_time=128,
-        base_freq=64,
-        n_fft=2048,
-        hop_length=512,
+        base_time=base_time,
+        base_freq=base_freq,
+        n_fft=n_fft,
+        hop_length=hop_length,
     )
 
     # Try strict load first
@@ -339,6 +341,12 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--overlap_seconds", type=float, default=1.0, help="Overlap between chunks in seconds")
     parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision on CUDA to reduce risk of NaNs")
     parser.add_argument("--use_ema", action="store_true", help="Load EMA shadow weights if checkpoint stores them")
+    parser.add_argument("--base_time", type=int, default=128, help="Base channel count for time UNet (must match training)")
+    parser.add_argument("--base_freq", type=int, default=64, help="Base channel count for freq branch (must match training)")
+    parser.add_argument("--n_fft", type=int, default=2048, help="STFT FFT size used during training")
+    parser.add_argument("--hop_length", type=int, default=512, help="STFT hop length used during training")
+    parser.add_argument("--sources", type=str, nargs="*", default=DEFAULT_SOURCES,
+                        help="List of source names (order must match training)")
     args = parser.parse_args(argv)
 
     ckpt_path = Path(args.ckpt)
@@ -354,7 +362,19 @@ def main(argv: list[str] | None = None):
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = load_model_from_ckpt(ckpt_path, device, use_ema=args.use_ema)
+    global SOURCES
+    SOURCES = tuple(args.sources)
+
+    model = load_model_from_ckpt(
+        ckpt_path,
+        device,
+        use_ema=args.use_ema,
+        base_time=args.base_time,
+        base_freq=args.base_freq,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        sources=SOURCES,
+    )
     use_amp = (not args.no_amp)
     process_input(model, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
 
