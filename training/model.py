@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="None of the inputs have requires_grad=True"
+)
 
 
 class ConvBlock(nn.Module):
@@ -185,9 +190,12 @@ class HybridTimeFreqUNet(nn.Module):
         # Cached Hann window for STFT; automatically moved to correct device
         self.register_buffer("stft_window", torch.hann_window(self.n_fft))
 
-    def _maybe_checkpoint(self, module: nn.Module, *args: torch.Tensor) -> torch.Tensor:
+    def _maybe_checkpoint(self, module: nn.Module, *args):
         if self.use_checkpoint and self.training:
-            return grad_checkpoint(module, *args)
+            def forward_fn(*inputs):
+                return module(*inputs)
+
+            return grad_checkpoint(forward_fn, *args, use_reentrant=True)
         return module(*args)
 
     def forward(self, mixture: torch.Tensor) -> torch.Tensor:

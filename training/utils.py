@@ -40,7 +40,8 @@ def load_checkpoint(path: Path,
         scaler.load_state_dict(ckpt["scaler"])
     epoch = int(ckpt.get("epoch", 0))
     step = int(ckpt.get("step", 0))
-    return epoch, step, ckpt.get("ema")
+    extra = ckpt.get("extra")
+    return epoch, step, ckpt.get("ema"), extra
 
 
 def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:

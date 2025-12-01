@@ -287,9 +287,21 @@ def train(
                 print(f"Warning: {ckpt_path} not found, starting from scratch.")
                 ckpt_path = None
         if ckpt_path is not None:
-            start_epoch, step, ema_state = load_checkpoint(ckpt_path, model, optimizer, scaler)
+            start_epoch, step, ema_state, extra = load_checkpoint(ckpt_path, model, optimizer, scaler)
             ema.load_state_dict(ema_state)
             print(f"Resumed from: {ckpt_path} | epoch={start_epoch}")
+    # Try to initialize best_si_sdr from existing best_sisdr.pt if present
+    best_ckpt_path = ckpt_dir / "best_sisdr.pt"
+    if best_ckpt_path.exists():
+        try:
+            _, _, _, best_extra = load_checkpoint(best_ckpt_path, model, None, None)
+            if isinstance(best_extra, dict):
+                m_best = best_extra.get("metrics")
+                if m_best and "si_sdr" in m_best:
+                    best_si_sdr = float(m_best["si_sdr"])
+                    print(f"Loaded best SI-SDR={best_si_sdr:.2f} dB from {best_ckpt_path}")
+        except Exception as exc:
+            print(f"Warning: could not read best_sisdr.pt metrics: {exc}")
 
     running_loss = 0.0
     best_si_sdr = -float("inf")
@@ -323,20 +335,24 @@ def train(
             metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds, max_batches=eval_batches, eval_num_workers=eval_num_workers)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            # Always keep latest metrics in periodic checkpoints; update best model only if SI-SDR improves.
             if metrics["si_sdr"] > best_si_sdr:
                 best_si_sdr = metrics["si_sdr"]
                 best_ckpt = ckpt_dir / "best_sisdr.pt"
-                save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler, extra={"ema": ema.state_dict()})
+                save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler,
+                               extra={"ema": ema.state_dict(), "metrics": metrics})
                 print(f"[Eval] New best model (SI-SDR={best_si_sdr:.2f} dB) has been saved to {best_ckpt}")
 
         if epoch % ckpt_every == 0:
             path = ckpt_dir / f"epoch_{epoch:04d}.pt"
-            save_checkpoint(path, model, optimizer, epoch, step, scaler, extra={"ema": ema.state_dict()})
+            save_checkpoint(path, model, optimizer, epoch, step, scaler,
+                           extra={"ema": ema.state_dict(), "metrics": metrics if 'metrics' in locals() else {}})
             print(f"[CKPT] Saved checkpoint: {path}")
 
     # Final save
     ckpt_path = ckpt_dir / f"final_step_{step:06d}.pt"
-    save_checkpoint(ckpt_path, model, optimizer, epoch, step, scaler, extra={"ema": ema.state_dict()})
+    save_checkpoint(ckpt_path, model, optimizer, epoch, step, scaler,
+                   extra={"ema": ema.state_dict(), "metrics": metrics if 'metrics' in locals() else {}})
     print(f"Saved final checkpoint: {ckpt_path}")
 
 
