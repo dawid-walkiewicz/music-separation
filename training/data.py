@@ -114,12 +114,13 @@ class MusdbRandomChunks(Dataset):
 
             target_list.append(self._to_tensor(audio))  # (C, L)
 
-        stacked = torch.stack(target_list, dim=0) # (S, C, L)
-        mixture = stacked.sum(dim=0) # (C, L)
-
-        targets = stacked
+        stacked = torch.stack(target_list, dim=0)  # (S, C, L)
+        if stacked.shape[1] != 1:
+            raise ValueError("This dataset currently expects mono stems (C=1) — set mono=True during init.")
+        stems = stacked[:, 0, :]  # (S, L)
+        mixture = stems.sum(dim=0, keepdim=True)  # (1, L)
 
         return {
             "mixture": mixture,
-            "targets": targets,
+            "targets": stems,
         }

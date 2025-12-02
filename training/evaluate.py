@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from training.data import MusdbRandomChunks
-from training.model import apply_masks
+from training.model import apply_masks, reconstruct_sources
 from training import losses
 
 try:
@@ -139,18 +139,19 @@ def evaluate(
 
         # batch["mixture"] shape from dataset: (C, L) because mono=True
         # DataLoader batch with batch_size=1 -> (B=1, C, L)
-        mixture = batch["mixture"].to(device, non_blocking=True)  # (1, 1, L)
-        targets = batch["targets"].to(device, non_blocking=True)  # (1, S, 1, L)
+        mixture = batch["mixture"].to(device, non_blocking=True)  # (B, 1, L)
+        targets = batch["targets"].to(device, non_blocking=True)  # (B, S, L)
 
-        masks = model(mixture)  # expects (B, C, L)
-        preds = apply_masks(mixture, masks)  # (B, S, 1, L)
+        masks = model(mixture)  # (B, S, Lm)
+        preds = reconstruct_sources(mixture, masks).unsqueeze(2)  # (B, S, 1, L)
+        targets_batch = targets.unsqueeze(2)
 
-        metrics = compute_sdr_metrics(preds, targets)
+        metrics = compute_sdr_metrics(preds, targets_batch)
         total_sdr += metrics["sdr"]
         total_si_sdr += metrics["si_sdr"]
         if mir_eval_available:
             try:
-                bss = compute_bss_metrics(preds, targets)
+                bss = compute_bss_metrics(preds, targets_batch)
                 for k in bss_stats:
                     bss_stats[k] += bss[k]
             except Exception as exc:

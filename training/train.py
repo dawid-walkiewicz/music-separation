@@ -10,9 +10,10 @@ import random
 
 from training.data import MusdbRandomChunks
 from training.evaluate import evaluate
-from training.model import HybridTimeFreqUNet, apply_masks, similarity_percent
+from training.model import HybridTimeFreqUNet, reconstruct_sources, similarity_percent
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
-from training.losses import get_loss_fn
+from training.losses import si_sdr_loss as base_sisdr_loss, mrstft_loss as mrstft_loss_freq, apply_pit
+
 
 torch.backends.cudnn.benchmark = True
 
@@ -83,7 +84,7 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level):
+def train_step(model, batch, optimizer, scaler, ema, device, use_cuda, log_level, mrstft_chunk_size, loss_type: str):
     times = {}
 
     if use_cuda and log_level == 2:
@@ -92,20 +93,38 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
     if log_level == 2:
         start = time.monotonic()
 
-    mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C=1, L)
-    targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C=1, L)
+    mixture = batch["mixture"].to(device, non_blocking=True)  # (B, 1, L)
+    targets = batch["targets"].to(device, non_blocking=True)  # (B, S, L)
 
     if log_level == 2:
         times["data"] = time.monotonic() - start
         start = time.monotonic()
 
     optimizer.zero_grad(set_to_none=True)
-    with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
+    with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_cuda):
         masks = model(mixture)  # (B, S, Lm)
-        preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
+        preds = reconstruct_sources(mixture, masks)  # (B, S, Lp)
         Lp = preds.shape[-1]
-        targets_c = targets[..., :Lp]  # match length
-        loss = loss_fn(preds, targets_c)
+        targets_c = targets[..., :Lp]  # (B, S, Lp)
+
+        # Wybór funkcji straty
+        if loss_type == "si_sdr":
+            loss = base_sisdr_loss(preds, targets_c)
+        elif loss_type == "si_sdr_pit":
+            loss = apply_pit(base_sisdr_loss, preds, targets_c)
+        elif loss_type == "si_sdr_pit_mrstft":
+            pit = apply_pit(base_sisdr_loss, preds, targets_c)
+            try:
+                stft = mrstft_loss_freq(preds, targets_c)
+            except ImportError:
+                stft = torch.tensor(0.0, device=preds.device, dtype=preds.dtype)
+            loss = pit + 0.1 * stft
+        else:
+            # Domyślnie zachowanie jak poprzednio (PIT SI-SDR + prosty MRSTFT z model.py)
+            from training.model import pit_si_sdr_loss, mrstft_loss as mrstft_loss_time
+            pit = pit_si_sdr_loss(preds, targets_c)
+            stft = mrstft_loss_time(preds, targets_c, chunk_size=mrstft_chunk_size)
+            loss = pit + 0.1 * stft
 
     with torch.no_grad():
         sim = similarity_percent(preds.detach(), targets_c.detach())
@@ -118,6 +137,7 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
         start = time.monotonic()
 
     scaler.scale(loss).backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
 
     if use_cuda and log_level == 2:
         torch.cuda.synchronize()
@@ -208,12 +228,16 @@ def train(
         seed: int = 42,
         resume: str | None = None,
         log_level: int = 0,
-        loss_name: str = "si_sdr_l1",
         eval_every: int = 5,
         items_per_epoch: int = 10_000,
         eval_batches: int = 20,
         use_checkpoint: bool = False,
         eval_num_workers: int = 0,
+        base_time: int = 128,
+        base_freq: int = 64,
+        mrstft_chunk_size: int = 2,
+        model_type: str = "hybrid",
+        loss_type: str = "si_sdr_pit",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -253,20 +277,23 @@ def train(
     )
 
     # Model, optimizer, EMA
-    model = HybridTimeFreqUNet(
-        n_sources=len(sources),
-        base_time=128,
-        base_freq=64,
-        n_fft=2048,
-        hop_length=512,
-        use_checkpoint=use_checkpoint,
-    ).to(device)
+    if model_type == "unet1d":
+        from training.model import UNet1D
+        model = UNet1D(
+            n_sources=len(sources),
+            base=base_time,
+        ).to(device)
+    else:
+        model = HybridTimeFreqUNet(
+            n_sources=len(sources),
+            base_time=base_time,
+            base_freq=base_freq,
+            use_checkpoint=use_checkpoint,
+        ).to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler(enabled=use_cuda)
     ema = EMA(model, decay=0.999)
-
-    loss_fn = get_loss_fn(loss_name)
-    print(f"Using loss: {loss_name}")
 
     workdir = Path(workdir)
     ckpt_dir = workdir / "checkpoints"
@@ -314,7 +341,7 @@ def train(
         for i, batch in enumerate(loader, start=1):
             step += 1
 
-            loss, sim, t = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level)
+            loss, sim, t = train_step(model, batch, optimizer, scaler, ema, device, use_cuda, log_level, mrstft_chunk_size, loss_type)
             running_loss += loss
             running_similarity += sim
 
@@ -384,11 +411,13 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
     parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
                         help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)")
-    parser.add_argument("--loss", type=str, default="si_sdr_l1",
-                        choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
-                        help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
     parser.add_argument("--use_checkpoint", action="store_true", help="Enable checkpointing in the model")
+    parser.add_argument("--base_time", type=int, default=128, help="Base channel width for time-domain UNet")
+    parser.add_argument("--base_freq", type=int, default=64, help="Base channel width for auxiliary branch")
+    parser.add_argument("--mrstft_chunk_size", type=int, default=2, help="Number of (batch*source) waveforms per MR-STFT chunk")
+    parser.add_argument("--model_type", type=str, default="hybrid", choices=["hybrid", "unet1d"], help="Model architecture to use")
+    parser.add_argument("--loss_type", type=str, default="si_sdr_pit", choices=["si_sdr", "si_sdr_pit", "si_sdr_pit_mrstft", "legacy"], help="Loss configuration")
 
     args = parser.parse_args()
 
@@ -409,10 +438,14 @@ if __name__ == "__main__":
         seed=args.seed,
         resume=args.resume,
         log_level=args.log_level,
-        loss_name=args.loss,
         eval_every=args.eval_every,
         items_per_epoch=args.items_per_epoch,
         eval_batches=args.eval_batches,
         use_checkpoint=args.use_checkpoint,
         eval_num_workers=args.eval_num_workers,
+        base_time=args.base_time,
+        base_freq=args.base_freq,
+        mrstft_chunk_size=args.mrstft_chunk_size,
+        model_type=args.model_type,
+        loss_type=args.loss_type,
     )
