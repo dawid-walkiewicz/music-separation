@@ -63,7 +63,20 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level, track_similarity=False):
+def train_step(
+        model,
+        batch,
+        optimizer,
+        scaler,
+        ema,
+        loss_fn,
+        device,
+        use_cuda,
+        log_level,
+        track_similarity=False,
+        mrstft_fn=None,
+        mrstft_weight=0.0,
+):
     times = {}
 
     if use_cuda and log_level == 2:
@@ -86,7 +99,10 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
         preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
         Lp = preds.shape[-1]
         targets_c = targets[..., :Lp]  # match length
-        loss = loss_fn(preds, targets_c)
+        loss_main = loss_fn(preds, targets_c)
+        loss = loss_main
+        if mrstft_fn is not None and mrstft_weight > 0.0:
+            loss = loss + mrstft_weight * mrstft_fn(preds, targets_c)
 
     if track_similarity:
         with torch.no_grad():
@@ -196,6 +212,15 @@ def train(
         eval_batches: int = 20,
         model_variant: str = "unet",
         grad_checkpoint: bool = False,
+        stft_fft: int = 2048,
+        stft_hop: int = 512,
+        stft_win_length: int | None = None,
+        freq_base: int = 48,
+        freq_depth: int = 4,
+        freq_out: int = 192,
+        time_hidden: int = 128,
+        time_layers: int = 8,
+        mrstft_weight: float = 0.3,
  ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -233,12 +258,30 @@ def train(
         generator=g,
     )
 
-    model = UNet1D(n_sources=len(sources), base=64, variant=model_variant, use_checkpoint=grad_checkpoint).to(device)
+    model = UNet1D(
+        n_sources=len(sources),
+        base=64,
+        variant=model_variant,
+        use_checkpoint=grad_checkpoint,
+        stft_fft=stft_fft,
+        stft_hop=stft_hop,
+        stft_win_length=stft_win_length,
+        freq_base=freq_base,
+        freq_depth=freq_depth,
+        freq_out=freq_out,
+        time_hidden=time_hidden,
+        time_layers=time_layers,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     ema = EMA(model, decay=0.999)
 
     loss_fn = get_loss_fn(loss_name)
+    mrstft_fn = None
+    if mrstft_weight > 0:
+        from training.losses import mrstft_loss
+        mrstft_fn = mrstft_loss
+
     print(f"Using loss: {loss_name}")
 
     workdir = Path(workdir)
@@ -292,17 +335,19 @@ def train(
             step += 1
 
             loss, t, sim = train_step(
-                model,
-                batch,
-                optimizer,
-                scaler,
-                ema,
-                loss_fn,
-                device,
-                use_cuda,
-                log_level,
-                track_similarity=track_similarity,
-            )
+                 model,
+                 batch,
+                 optimizer,
+                 scaler,
+                 ema,
+                 loss_fn,
+                 device,
+                 use_cuda,
+                 log_level,
+                 track_similarity=track_similarity,
+                mrstft_fn=mrstft_fn,
+                mrstft_weight=mrstft_weight,
+             )
             running_loss += loss
 
             if track_similarity and sim is not None:
@@ -388,14 +433,23 @@ if __name__ == "__main__":
     parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
                         help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)")
     parser.add_argument("--loss", type=str, default="si_sdr_l1",
-                        choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
-                        help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
+                        choices=["l1", "si_sdr", "mrstft", "si_sdr_l1", "si_sdr_l1_mrstft"],
+                        help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1, si_sdr_l1_mrstft")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
     parser.add_argument("--eval_batches", type=int, default=20, help="Number of validation batches during eval")
     parser.add_argument("--model_variant", type=str, default="unet", choices=["unet", "hybrid"],
                         help="Choose between base UNet and hybrid temporal variant.")
     parser.add_argument("--grad_checkpoint", action="store_true",
                         help="Enable gradient checkpointing for lower memory usage (slower).")
+    parser.add_argument("--stft_fft", type=int, default=2048, help="FFT size for hybrid model")
+    parser.add_argument("--stft_hop", type=int, default=512, help="STFT hop length for hybrid model")
+    parser.add_argument("--stft_win_length", type=int, default=None, help="STFT window length for hybrid model")
+    parser.add_argument("--freq_base", type=int, default=48, help="Base channel count for frequency UNet")
+    parser.add_argument("--freq_depth", type=int, default=4, help="Number of downsampling stages in frequency UNet")
+    parser.add_argument("--freq_out", type=int, default=192, help="Channel count before mask head")
+    parser.add_argument("--time_hidden", type=int, default=128, help="Hidden width of temporal path")
+    parser.add_argument("--time_layers", type=int, default=8, help="Number of residual TCN blocks")
+    parser.add_argument("--mrstft_weight", type=float, default=0.3, help="Weight for MR-STFT loss component")
 
     args = parser.parse_args()
 
@@ -421,4 +475,13 @@ if __name__ == "__main__":
         eval_batches=args.eval_batches,
         model_variant=args.model_variant,
         grad_checkpoint=args.grad_checkpoint,
+        stft_fft=args.stft_fft,
+        stft_hop=args.stft_hop,
+        stft_win_length=args.stft_win_length,
+        freq_base=args.freq_base,
+        freq_depth=args.freq_depth,
+        freq_out=args.freq_out,
+        time_hidden=args.time_hidden,
+        time_layers=args.time_layers,
+        mrstft_weight=args.mrstft_weight,
     )

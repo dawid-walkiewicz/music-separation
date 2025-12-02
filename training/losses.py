@@ -220,4 +220,12 @@ def get_loss_fn(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tenso
         def _hybrid(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
             return 0.5 * si_sdr_loss(preds, targets) + 0.5 * l1_loss(preds, targets, reduction="mean")
         return _hybrid
+    if name == 'si_sdr_l1_mrstft':
+        def _hybrid_mrstft(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            return (
+                0.4 * si_sdr_loss(preds, targets)
+                + 0.4 * l1_loss(preds, targets, reduction="mean")
+                + 0.2 * mrstft_loss(preds, targets)
+            )
+        return _hybrid_mrstft
     raise ValueError(f"Unknown loss name: {name}. Choose from: l1, si_sdr, mrstft, si_sdr_l1, hybrid")
