@@ -175,6 +175,36 @@ def mrstft_loss(preds: torch.Tensor, targets: torch.Tensor,
     return loss
 
 
+def similarity_percent(preds: torch.Tensor, targets: torch.Tensor) -> float:
+    """Percent similarity to reference stems (higher is better)."""
+    if preds.dim() == 3:
+        preds = preds.unsqueeze(2)
+    if targets.dim() == 3:
+        targets = targets.unsqueeze(2)
+
+    L = min(preds.shape[-1], targets.shape[-1])
+    preds = preds[..., :L]
+    targets = targets[..., :L]
+
+    mse = torch.mean((preds - targets) ** 2)
+    var = torch.mean(targets ** 2) + 1e-8
+
+    amp_t = targets.abs()
+    amp_p = preds.abs()
+    max_t = amp_t.amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    t_norm = amp_t / max_t
+    p_norm = amp_p / max_t
+
+    thr_sil = 0.1
+    mask_silence = (t_norm < thr_sil).to(torch.float32)
+    excess = (mask_silence * (p_norm ** 2)).mean()
+
+    alpha = 0.5
+    error = mse + alpha * excess
+    sim = torch.clamp(1.0 - error / var, 0.0, 1.0) * 100.0
+    return float(sim.item())
+
+
 def get_loss_fn(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return a loss function by name. The returned callable accepts (preds, targets) and
     returns a scalar tensor suitable for training.

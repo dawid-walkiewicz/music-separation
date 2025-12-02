@@ -12,7 +12,7 @@ from training.data import MusdbRandomChunks
 from training.evaluate import evaluate
 from training.model import UNet1D, apply_masks
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
-from training.losses import get_loss_fn
+from training.losses import get_loss_fn, similarity_percent
 
 torch.backends.cudnn.benchmark = True
 
@@ -63,7 +63,7 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level):
+def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level, track_similarity=False):
     times = {}
 
     if use_cuda and log_level == 2:
@@ -80,12 +80,17 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
         start = time.monotonic()
 
     optimizer.zero_grad(set_to_none=True)
+    sim = None
     with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
         masks = model(mixture)  # (B, S, Lm)
         preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
         Lp = preds.shape[-1]
         targets_c = targets[..., :Lp]  # match length
         loss = loss_fn(preds, targets_c)
+
+    if track_similarity:
+        with torch.no_grad():
+            sim = similarity_percent(preds.detach(), targets_c.detach())
 
     if use_cuda and log_level == 2:
         torch.cuda.synchronize()
@@ -113,10 +118,10 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
     if log_level == 2:
         times["optim"] = time.monotonic() - start
 
-    return float(loss.item()), times
+    return float(loss.item()), times, sim
 
 
-def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time):
+def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time, avg_similarity=None):
     avg_loss = running_loss / (log_every * epoch_size)
 
     current_time = time.monotonic()
@@ -131,6 +136,8 @@ def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size,
 
     log_parts.append(f"Epoch {epoch:6d}")
     log_parts.append(f"Avg Loss: {avg_loss:.5f}")
+    if log_level >= 1 and avg_similarity is not None:
+        log_parts.append(f"Similarity: {avg_similarity:.2f}%")
     log_parts.append(f"{steps_per_sec:.2f} steps/s")
 
     print(f"\n{' | '.join(log_parts)}")
@@ -147,7 +154,7 @@ def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size,
     return current_time
 
 
-def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds):
+def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds, eval_batches):
     print("\n[Eval] Copying EMA weights and computing metrics on the validation set...")
 
     backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -159,9 +166,11 @@ def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment
         sources=sources,
         segment_seconds=segment_seconds,
         device=device,
-        max_batches=20,
+        max_batches=eval_batches,
     )
     model.load_state_dict(backup)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     print(f"[Eval] Epoch {epoch:6d} | SDR: {metrics['sdr']:.2f} dB | SI-SDR: {metrics['si_sdr']:.2f} dB")
     return metrics
 
@@ -184,7 +193,10 @@ def train(
         log_level: int = 0,
         loss_name: str = "si_sdr_l1",
         eval_every: int = 5,
-):
+        eval_batches: int = 20,
+        model_variant: str = "unet",
+        grad_checkpoint: bool = False,
+ ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
     if use_cuda:
@@ -221,7 +233,7 @@ def train(
         generator=g,
     )
 
-    model = UNet1D(n_sources=len(sources), base=64).to(device)
+    model = UNet1D(n_sources=len(sources), base=64, variant=model_variant, use_checkpoint=grad_checkpoint).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     ema = EMA(model, decay=0.999)
@@ -232,6 +244,22 @@ def train(
     workdir = Path(workdir)
     ckpt_dir = workdir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    best_ckpt_path = ckpt_dir / "best_sisdr.pt"
+    best_metrics = None
+    best_si_sdr = -float("inf")
+    if best_ckpt_path.exists():
+        try:
+            payload = torch.load(str(best_ckpt_path), map_location="cpu", weights_only=True)
+            extra = payload.get("extra") or {}
+            best_metrics = extra.get("metrics")
+            if best_metrics and "si_sdr" in best_metrics:
+                best_si_sdr = float(best_metrics["si_sdr"])
+                print(f"[Init] Loaded previous best SI-SDR={best_si_sdr:.2f} dB from {best_ckpt_path}")
+        except Exception as exc:
+            print(f"Warning: Could not read previous best checkpoint: {exc}")
+            best_metrics = None
+            best_si_sdr = -float("inf")
 
     # Optional resume
     start_epoch = 0
@@ -252,17 +280,34 @@ def train(
             print(f"Resumed from: {ckpt_path} | epoch={start_epoch}")
 
     running_loss = 0.0
-    best_si_sdr = -float("inf")
 
     log_times = {"data": 0, "forward": 0, "backward": 0, "optim": 0}
     last_log_time = time.monotonic()
+    track_similarity = log_level >= 1
+    similarity_sum = 0.0
+    similarity_steps = 0
 
     for epoch in range(start_epoch + 1, epochs + 1):
         for i, batch in enumerate(loader, start=1):
             step += 1
 
-            loss, t = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level)
+            loss, t, sim = train_step(
+                model,
+                batch,
+                optimizer,
+                scaler,
+                ema,
+                loss_fn,
+                device,
+                use_cuda,
+                log_level,
+                track_similarity=track_similarity,
+            )
             running_loss += loss
+
+            if track_similarity and sim is not None:
+                similarity_sum += sim
+                similarity_steps += 1
 
             if log_level == 2:
                 for key in log_times.keys():
@@ -272,17 +317,39 @@ def train(
                 break
 
         if epoch % log_every == 0:
-            last_log_time = log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time)
+            avg_similarity = None
+            if track_similarity and similarity_steps > 0:
+                avg_similarity = similarity_sum / similarity_steps
+            last_log_time = log_status(
+                epoch,
+                running_loss,
+                log_times,
+                log_every,
+                log_level,
+                epoch_size,
+                last_log_time,
+                avg_similarity=avg_similarity,
+            )
             running_loss = 0.0
             log_times = {k: 0.0 for k in log_times}
+            similarity_sum = 0.0
+            similarity_steps = 0
 
         if epoch % eval_every == 0:
-            metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds)
+            metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds, eval_batches)
             if metrics["si_sdr"] > best_si_sdr:
                 best_si_sdr = metrics["si_sdr"]
-                best_ckpt = ckpt_dir / "best_sisdr.pt"
-                save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler)
-                print(f"[Eval] New best model (SI-SDR={best_si_sdr:.2f} dB) has been saved to {best_ckpt}")
+                best_metrics = metrics
+                save_checkpoint(
+                    best_ckpt_path,
+                    model,
+                    optimizer,
+                    step,
+                    epoch,
+                    scaler,
+                    extra={"metrics": metrics},
+                )
+                print(f"[Eval] New best model (SI-SDR={best_si_sdr:.2f} dB) has been saved to {best_ckpt_path}")
 
         if epoch % ckpt_every == 0:
             path = ckpt_dir / f"epoch_{epoch:04d}.pt"
@@ -324,6 +391,11 @@ if __name__ == "__main__":
                         choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
                         help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
+    parser.add_argument("--eval_batches", type=int, default=20, help="Number of validation batches during eval")
+    parser.add_argument("--model_variant", type=str, default="unet", choices=["unet", "hybrid"],
+                        help="Choose between base UNet and hybrid temporal variant.")
+    parser.add_argument("--grad_checkpoint", action="store_true",
+                        help="Enable gradient checkpointing for lower memory usage (slower).")
 
     args = parser.parse_args()
 
@@ -346,4 +418,7 @@ if __name__ == "__main__":
         log_level=args.log_level,
         loss_name=args.loss,
         eval_every=args.eval_every,
+        eval_batches=args.eval_batches,
+        model_variant=args.model_variant,
+        grad_checkpoint=args.grad_checkpoint,
     )
