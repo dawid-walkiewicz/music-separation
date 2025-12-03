@@ -189,11 +189,34 @@ def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
     raise RuntimeError("No audio backend available for writing: install soundfile or torchaudio")
 
 
-def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
+def load_model_from_ckpt(ckpt_path: Path,
+                         device: torch.device,
+                         variant: str = "unet",
+                         stft_fft: int = 1024,
+                         stft_hop: int = 256,
+                         stft_win_length: int | None = None,
+                         freq_base: int = 32,
+                         freq_depth: int = 3,
+                         freq_out: int = 128,
+                         time_hidden: int = 112,
+                         time_layers: int = 6):
     ckpt = torch.load(str(ckpt_path), map_location="cpu")
     n_sources = len(SOURCES)
-    model = UNet1D(n_sources=n_sources, base=64)
-    model.load_state_dict(ckpt["model"])
+    model = UNet1D(
+        n_sources=n_sources,
+        base=64,
+        variant=variant,
+        use_checkpoint=False,
+        stft_fft=stft_fft,
+        stft_hop=stft_hop,
+        stft_win_length=stft_win_length,
+        freq_base=freq_base,
+        freq_depth=freq_depth,
+        freq_out=freq_out,
+        time_hidden=time_hidden,
+        time_layers=time_layers,
+    )
+    model.load_state_dict(ckpt["model"], strict=False)
     model.to(device)
     model.eval()
     return model
@@ -252,6 +275,16 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--chunk_seconds", type=float, default=8.0, help="Chunk length in seconds for inference")
     parser.add_argument("--overlap_seconds", type=float, default=1.0, help="Overlap between chunks in seconds")
     parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision on CUDA to reduce risk of NaNs")
+    parser.add_argument("--model_variant", type=str, default="unet", choices=["unet", "hybrid"],
+                        help="Model variant to use: unet or hybrid")
+    parser.add_argument("--stft_fft", type=int, default=1024, help="FFT size for hybrid model (for checking consistency)")
+    parser.add_argument("--stft_hop", type=int, default=256, help="STFT hop length for hybrid model")
+    parser.add_argument("--stft_win_length", type=int, default=None, help="STFT window length for hybrid model")
+    parser.add_argument("--freq_base", type=int, default=32, help="Base channels in frequency UNet (must match training)")
+    parser.add_argument("--freq_depth", type=int, default=3, help="Depth of frequency UNet (must match training)")
+    parser.add_argument("--freq_out", type=int, default=128, help="Frequency UNet output channels before mask head")
+    parser.add_argument("--time_hidden", type=int, default=112, help="Hidden size in temporal path (must match training)")
+    parser.add_argument("--time_layers", type=int, default=6, help="Number of temporal blocks (must match training)")
     args = parser.parse_args(argv)
 
     ckpt_path = Path(args.ckpt)
@@ -262,12 +295,24 @@ def main(argv: list[str] | None = None):
     input_path = Path(args.input)
     out_root = Path(args.out)
 
-    if args.device:
-        device = torch.device(args.device)
-    else:
+    if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
-    model = load_model_from_ckpt(ckpt_path, device)
+    model = load_model_from_ckpt(
+        ckpt_path,
+        device,
+        variant=args.model_variant,
+        stft_fft=args.stft_fft,
+        stft_hop=args.stft_hop,
+        stft_win_length=args.stft_win_length,
+        freq_base=args.freq_base,
+        freq_depth=args.freq_depth,
+        freq_out=args.freq_out,
+        time_hidden=args.time_hidden,
+        time_layers=args.time_layers,
+    )
     use_amp = (not args.no_amp)
     process_input(model, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
 
