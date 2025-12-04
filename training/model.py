@@ -1,102 +1,103 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio.transforms as T
+EPS = 1e-8
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
-        super().__init__()
-        self.conv = nn.Conv1d(in_ch, out_ch, k, s, p)
-        self.bn = nn.BatchNorm1d(out_ch)
-        self.act = nn.ReLU(inplace=True)
+class UNet(nn.Module):
+    """An implementation of U-Net for music source separation.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
+    It has been proposed in "Singing Voice Separation with Deep U-Net
+    Convolutional Networks".
+    (https://ismir2017.smcnus.org/wp-content/uploads/2017/10/171_Paper.pdf)
 
-
-class UNet1D(nn.Module):
+    Args:
+        n_class (int): Number of output classes.
     """
-    Simple 1D U-Net for time-domain source separation.
-    Input: mixture (C, L) where C=1, L=segment_samples
-    Output: masks for S sources: (S, C, L). Multiplied by mixture -> predicted sources.
+    def __init__(self, n_class):
+        super(UNet, self).__init__()
+
+        self.conv1 = torch.nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2)
+        self.conv_bn1 = torch.nn.BatchNorm2d(16)
+        self.conv2 = torch.nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2)
+        self.conv_bn2 = torch.nn.BatchNorm2d(32)
+        self.conv3 = torch.nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2)
+        self.conv_bn3 = torch.nn.BatchNorm2d(64)
+        self.conv4 = torch.nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2)
+        self.conv_bn4 = torch.nn.BatchNorm2d(128)
+        self.conv5 = torch.nn.Conv2d(128, 256, kernel_size=5, stride=2, padding=2)
+        self.conv_bn5 = torch.nn.BatchNorm2d(256)
+        self.conv6 = torch.nn.Conv2d(256, 512, kernel_size=5, stride=2, padding=2)
+        self.conv_bn6 = torch.nn.BatchNorm2d(512)
+
+        self.deconv1 = torch.nn.ConvTranspose2d(512, 256, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.deconv_bn1 = torch.nn.BatchNorm2d(256)
+        self.dropout1 = torch.nn.Dropout2d(0.5)
+        self.deconv2 = torch.nn.ConvTranspose2d(512, 128, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.deconv_bn2 = torch.nn.BatchNorm2d(128)
+        self.dropout2 = torch.nn.Dropout2d(0.5)
+        self.deconv3 = torch.nn.ConvTranspose2d(256, 64, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.deconv_bn3 = torch.nn.BatchNorm2d(64)
+        self.dropout3 = torch.nn.Dropout2d(0.5)
+        self.deconv4 = torch.nn.ConvTranspose2d(128, 32, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.deconv_bn4 = torch.nn.BatchNorm2d(32)
+        self.deconv5 = torch.nn.ConvTranspose2d(64, 16, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.deconv_bn5 = torch.nn.BatchNorm2d(16)
+        self.deconv6 = torch.nn.ConvTranspose2d(32, n_class, kernel_size=5, stride=2, padding=2, output_padding=1)
+
+    def forward(self, x):
+        """Compute the separation mask.
+
+        Args:
+            x (torch.Tensor): Shape of (n_batch, n_frequency, n_frame).
+                The number of time frames should be a multiple of 64.
+
+        Returns:
+            torch.Tensor: Shape of (n_batch, n_part, n_frequency, n_frame).
+                Separation mask.
+        """
+        # Add channel dimension
+        x = x.unsqueeze(1)
+
+        x = torch.log(x + EPS)
+        h1 = F.leaky_relu(self.conv_bn1(self.conv1(x)), 0.2)
+        h2 = F.leaky_relu(self.conv_bn2(self.conv2(h1)), 0.2)
+        h3 = F.leaky_relu(self.conv_bn3(self.conv3(h2)), 0.2)
+        h4 = F.leaky_relu(self.conv_bn4(self.conv4(h3)), 0.2)
+        h5 = F.leaky_relu(self.conv_bn5(self.conv5(h4)), 0.2)
+        h = F.leaky_relu(self.conv_bn6(self.conv6(h5)), 0.2)
+
+        h = self.dropout1(F.relu(self.deconv_bn1(self.deconv1(h))))
+        h = torch.cat((h, h5), dim=1)
+        h = self.dropout2(F.relu(self.deconv_bn2(self.deconv2(h))))
+        h = torch.cat((h, h4), dim=1)
+        h = self.dropout3(F.relu(self.deconv_bn3(self.deconv3(h))))
+        h = torch.cat((h, h3), dim=1)
+        h = F.relu(self.deconv_bn4(self.deconv4(h)))
+        h = torch.cat((h, h2), dim=1)
+        h = F.relu(self.deconv_bn5(self.deconv5(h)))
+        h = torch.cat((h, h1), dim=1)
+        h = F.softmax(self.deconv6(h), dim=1)
+        return h
+
+
+def padding(sound_stft):
+    """Apply reflection padding to ensure that number of time frames of
+    `sound`'s STFT representation is multiple of 64.
+
+    Args:
+        sound_stft (torch.Tensor): Spectrogram to be padded.
+
+    Returns:
+        Tuple[torch.Tensor, Tuple[int, int]]: Reflection padded spectrogram and
+            number of rows padded to left-side and right-side, respectively.
     """
-
-    def __init__(self, n_sources: int = 4, base: int = 64):
-        super().__init__()
-        self.n_sources = n_sources
-        ch = base
-
-        # Encoder
-        self.e1 = nn.Sequential(ConvBlock(1, ch), ConvBlock(ch, ch))
-        self.d1 = nn.Conv1d(ch, ch, 4, 2, 1)
-
-        self.e2 = nn.Sequential(ConvBlock(ch, ch * 2), ConvBlock(ch * 2, ch * 2))
-        self.d2 = nn.Conv1d(ch * 2, ch * 2, 4, 2, 1)
-
-        self.e3 = nn.Sequential(ConvBlock(ch * 2, ch * 4), ConvBlock(ch * 4, ch * 4))
-        self.d3 = nn.Conv1d(ch * 4, ch * 4, 4, 2, 1)
-
-        # Bottleneck
-        self.b = nn.Sequential(
-            ConvBlock(ch * 4, ch * 8),
-            nn.Dropout(0.2),
-            ConvBlock(ch * 8, ch * 8),
-        )
-
-        # Decoder
-        self.u3 = nn.ConvTranspose1d(ch * 8, ch * 4, 4, 2, 1)
-        self.p3 = nn.Sequential(ConvBlock(ch * 8, ch * 4), ConvBlock(ch * 4, ch * 4))
-
-        self.u2 = nn.ConvTranspose1d(ch * 4, ch * 2, 4, 2, 1)
-        self.p2 = nn.Sequential(ConvBlock(ch * 4, ch * 2), ConvBlock(ch * 2, ch * 2))
-
-        self.u1 = nn.ConvTranspose1d(ch * 2, ch, 4, 2, 1)
-        self.p1 = nn.Sequential(ConvBlock(ch * 2, ch), ConvBlock(ch, ch))
-
-        # Output masks
-        self.out = nn.Conv1d(ch, n_sources, 1)
-        self.act_out = nn.Softmax(dim=1)  # masks in [0,1]
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, mixture: torch.Tensor) -> torch.Tensor:
-        # mixture: (B, C=1, L)
-        x1 = self.e1(mixture)  # (B, ch, L)
-        x2 = self.e2(F.leaky_relu(self.d1(x1), 0.1))  # (B, 2ch, L/2)
-        x3 = self.e3(F.leaky_relu(self.d2(x2), 0.1))  # (B, 4ch, L/4)
-        xb = self.b(F.leaky_relu(self.d3(x3), 0.1))   # (B, 8ch, L/8)
-
-        y3 = self.u3(xb)  # (B, 4ch, ~L/4)
-
-        y3 = torch.cat([y3, x3], dim=1)
-        y3 = self.p3(y3)
-
-        y2 = self.u2(y3)  # (B, 2ch, ~L/2)
-        y2 = torch.cat([y2, x2], dim=1)
-        y2 = self.p2(y2)
-
-        y1 = self.u1(y2)  # (B, ch, ~L)
-        y1 = torch.cat([y1, x1], dim=1)
-        y1 = self.p1(y1)
-
-        masks = self.act_out(self.out(y1))  # (B, S, ~L)
-        return masks
-
-
-def apply_masks(mixture: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-    """
-    mixture: (B, 1, L)
-    masks: (B, S, Lm)
-    -> sources: (B, S, 1, Lc) where Lc = min(L, Lm)
-    """
-    Lc = min(mixture.shape[-1], masks.shape[-1])
-    mixture = mixture[..., :Lc]
-    masks = masks[..., :Lc]
-    return masks.unsqueeze(2) * mixture.unsqueeze(1)
+    n_frames = sound_stft.size(-1)
+    n_pad = (64 - n_frames % 64) % 64
+    if n_pad:
+        left = n_pad // 2
+        right = n_pad - left
+        return F.pad(sound_stft, (left, right), mode='reflect'), (left, right)
+    else:
+        return sound_stft, (0, 0)
