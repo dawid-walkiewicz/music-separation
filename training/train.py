@@ -10,7 +10,7 @@ import random
 
 from training.data import MusdbRandomChunks
 from training.evaluate import evaluate
-from training.model import UNet1D, apply_masks
+from training.model import UNet2d, apply_masks
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
 from training.losses import get_loss_fn
 
@@ -221,7 +221,7 @@ def train(
         generator=g,
     )
 
-    model = UNet1D(n_sources=len(sources), base=64).to(device)
+    model = UNet2d(n_sources=len(sources)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     ema = EMA(model, decay=0.999)
