@@ -48,7 +48,7 @@ def compute_log_power_spectrogram(waveform, sr, n_fft=2048, hop_length=512, win_
     magnitude = stft.abs()
     power = magnitude ** 2
     # Przelicz na decybele (dB), zabezpiecz przed log(0)
-    log_power = 10.0 * torch.log10(power + eps)
+    log_power =  10 * torch.log10(power + eps)
     return log_power
 
 
