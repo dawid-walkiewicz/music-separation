@@ -81,6 +81,7 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
         start = time.monotonic()
 
     optimizer.zero_grad(set_to_none=True)
+    # this probably needs to be changed
     with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
         masks = model(mixture)  # (B, S, Lm)
         preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
