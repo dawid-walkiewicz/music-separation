@@ -10,7 +10,8 @@ import random
 
 from training.data import MusdbRandomChunks
 from training.evaluate import evaluate
-from training.model import UNet2d, apply_masks
+from training.model import UNet1D, apply_masks
+from training.new_model import NewSeparationModel
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
 from training.losses import get_loss_fn
 
@@ -184,6 +185,7 @@ def train(
         log_level: int = 0,
         loss_name: str = "si_sdr_l1",
         eval_every: int = 5,
+        model_name: str = "unet1d",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -221,7 +223,15 @@ def train(
         generator=g,
     )
 
-    model = UNet2d(n_sources=len(sources)).to(device)
+    model_registry = {
+        "unet1d": lambda: UNet1D(n_sources=len(sources), base=64),
+        "new_model": lambda: NewSeparationModel(n_sources=len(sources)),
+    }
+    if model_name not in model_registry:
+        raise ValueError(f"Unknown model '{model_name}'. Available: {sorted(model_registry.keys())}")
+    model = model_registry[model_name]().to(device)
+    print(f"Using model: {model_name}")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     ema = EMA(model, decay=0.999)
@@ -324,6 +334,9 @@ if __name__ == "__main__":
                         choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
                         help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
+    parser.add_argument("--model", type=str, default="unet1d",
+                        choices=["unet1d", "new_model"],
+                        help="Model architecture to train")
 
     args = parser.parse_args()
 
@@ -346,4 +359,5 @@ if __name__ == "__main__":
         log_level=args.log_level,
         loss_name=args.loss,
         eval_every=args.eval_every,
+        model_name=args.model,
     )
