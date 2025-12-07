@@ -125,7 +125,7 @@ Przykładowa inferencja w Pythonie (opcjonalnie):
 ```python
 import torch
 import numpy as np
-from training.model import UNet1D, apply_masks
+from models.unet1d.model import UNet1D, apply_masks
 
 # Załaduj model
 model = UNet1D(n_sources=4)

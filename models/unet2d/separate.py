@@ -2,18 +2,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-import torch
+
 import numpy as np
+import torch
 
-# Ensure project root on sys.path for 'training' imports
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from models.unet2d.model import Unet2DWrapper
 
-# Local imports
-from training.model import UNet1D, apply_masks
-
-# Try backends for audio IO
 _have_soundfile = False
 _have_torchaudio = False
 _have_resampy = False
@@ -56,33 +50,109 @@ def _resample_np_mono(wave_mono: np.ndarray, sr: int, target_sr: int) -> np.ndar
     raise RuntimeError("Need resampling support: install `resampy` or `torchaudio` to resample audio")
 
 
-def _forward_sources(model: torch.nn.Module, wav_mono: np.ndarray, device: torch.device, amp: bool = True) -> np.ndarray:
-    """Run model on a mono waveform and return sources as np array (S, Lout)."""
-    assert wav_mono.ndim == 1
-    x = torch.from_numpy(wav_mono[None, None, :].astype(np.float32)).to(device)
-    with torch.no_grad():
-        if amp and device.type == "cuda":
-            with torch.cuda.amp.autocast():
-                masks = model(x)  # (1, S, Lm)
+def read_audio(path: Path, target_sr: int = TARGET_SR) -> np.ndarray:
+    """Read audio file and return mono or stereo float32 numpy array at target_sr.
+
+    Returns shape (C, L) with values in float32. C can be 1 or 2.
+    Supports: wav/mp3/flac/ogg/m4a via soundfile/torchaudio, and MUSDB .stem.mp4 via stempeg.
+    """
+    path = Path(path)
+    ext = path.suffix.lower()
+
+    # Special case: MUSDB stem file
+    if ext == ".mp4" and path.name.endswith(".stem.mp4"):
+        if not _have_stempeg:
+            raise RuntimeError("Reading .stem.mp4 requires `stempeg`. Install it and try again.")
+        stems, sr = stempeg.read_stems(str(path), dtype=np.float32)  # (S, T, C)
+        if stems.ndim == 3 and stems.shape[0] >= 1:
+            mix = stems[0]  # (T, C)
         else:
-            masks = model(x)
-        sources = apply_masks(x, masks)  # (1, S, 1, Lc)
-    sources = sources[0, :, 0].detach().cpu().numpy()  # (S, Lc)
-    return sources
+            mix = stems.sum(axis=0)  # (T, C)
+        mix = mix.T  # (C, L)
+        if sr != target_sr:
+            if mix.shape[0] > 1:
+                mix_res = []
+                for ch in range(mix.shape[0]):
+                    mix_res.append(_resample_np_mono(mix[ch], sr, target_sr))
+                mix = np.stack(mix_res, axis=0)
+            else:
+                mix = _resample_np_mono(mix.squeeze(0), sr, target_sr)[None, :]
+        return mix.astype(np.float32, copy=False)
+
+    # Generic audio via soundfile
+    if _have_soundfile:
+        data, sr = sf.read(str(path), always_2d=True)  # (L, C)
+        data = data.T  # (C, L)
+        if sr != target_sr:
+            if data.shape[0] > 1:
+                res = []
+                for ch in range(data.shape[0]):
+                    res.append(_resample_np_mono(data[ch], sr, target_sr))
+                data = np.stack(res, axis=0)
+            else:
+                data = _resample_np_mono(data.squeeze(0), sr, target_sr)[None, :]
+        return data.astype(np.float32, copy=False)
+
+    # Fallback via torchaudio
+    if _have_torchaudio:
+        wav, sr = torchaudio.load(str(path))  # (C, L)
+        if sr != target_sr:
+            wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
+        return wav.numpy().astype(np.float32)
+
+    raise RuntimeError("No audio backend available: install soundfile (pysoundfile) or torchaudio or stempeg for .stem.mp4")
+
+
+def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # data: (L,) or (C, L)
+    if data.ndim == 1:
+        data_to_write = data
+    else:
+        data_to_write = data.T  # (L, C)
+    if _have_soundfile:
+        sf.write(str(path), data_to_write, sr)
+        return
+    if _have_torchaudio:
+        wav = torch.from_numpy(data).float()
+        torchaudio.save(str(path), wav, sample_rate=sr)
+        return
+    raise RuntimeError("No audio backend available for writing: install soundfile or torchaudio")
+
+
+def _ensure_stereo(wav: np.ndarray) -> np.ndarray:
+    """Ensure waveform is stereo: input (C, L) -> (2, L)."""
+    if wav.ndim != 2:
+        raise ValueError(f"Expected audio with shape (C, L), got {wav.shape}")
+    C, L = wav.shape
+    if C == 2:
+        return wav
+    if C == 1:
+        return np.tile(wav, (2, 1))
+    # More than 2 channels: use first two
+    return wav[:2]
 
 
 def separate_chunked(model: torch.nn.Module,
-                     wav_mono: np.ndarray,
+                     wav: np.ndarray,
                      sr: int,
                      device: torch.device,
                      chunk_seconds: float = 8.0,
                      overlap_seconds: float = 1.0,
                      amp: bool = True) -> np.ndarray:
-    """Chunked separation with overlap-add to avoid GPU OOM and seam artifacts.
+    """Chunked separation with overlap-add using Unet2DWrapper.
 
-    Returns: np.ndarray shape (S, L)
+    Args:
+        model:   Unet2DWrapper instance
+        wav:     np.ndarray (C, L), mono or stereo
+        sr:      sample rate
+        device:  torch.device
+
+    Returns:
+        sources: np.ndarray of shape (S, L), mono mix-down of separated sources.
     """
-    L = int(wav_mono.shape[0])
+    wav = _ensure_stereo(wav)  # (2, L)
+    L = wav.shape[1]
     if L == 0:
         return np.zeros((len(SOURCES), 0), dtype=np.float32)
 
@@ -96,103 +166,53 @@ def separate_chunked(model: torch.nn.Module,
     pos = 0
     while pos < L:
         end = min(pos + chunk, L)
-        chunk_wav = wav_mono[pos:end]
-        # Forward
-        pred = _forward_sources(model, chunk_wav, device, amp)  # (S, M)
+        chunk_wav = wav[:, pos:end]  # (2, M)
+
+        # To tensor on device
+        chunk_tensor = torch.from_numpy(chunk_wav).to(device)
+
+        with torch.no_grad():
+            if amp and device.type == "cuda":
+                with torch.cuda.amp.autocast():
+                    out_dict = model.separate(chunk_tensor)  # name -> (2, M_out)
+            else:
+                out_dict = model.separate(chunk_tensor)
+
+        stem_names = list(model.stems.keys())
+        stems = [out_dict[name].cpu().numpy() for name in stem_names]  # list of (2, M_out)
+        stems = np.stack(stems, axis=0)  # (S, 2, M_out)
+        # Downmix to mono for writing / evaluation
+        pred = stems.mean(axis=1)  # (S, M_out)
         M = pred.shape[1]
-        # Create window of length M (Hann), avoid zeros at exact edges for averaging stability on tiny chunks
+
+        # Window for overlap-add
         if M > 1:
             win = np.hanning(M).astype(np.float32)
-            # If chunk not overlapped (e.g., first/last), ensure non-zero weights
             if pos == 0:
                 win[: M // 4] = np.maximum(win[: M // 4], 0.5)
             if end == L:
                 win[-(M // 4):] = np.maximum(win[-(M // 4):], 0.5)
         else:
             win = np.ones(M, dtype=np.float32)
-        # Accumulate
+
         out[:, pos:pos + M] += pred * win[None, :]
         weight[pos:pos + M] += win
         pos += hop
 
-    # Normalize by weights to combine overlaps
     nz = weight > 0
     out[:, nz] /= weight[nz][None, :]
-    # Fill any untouched samples (edge cases) by simple copy from nearest (optional)
     if not np.all(nz):
         idx = np.where(~nz)[0]
         for i in idx:
             j = i - 1 if i > 0 else i + 1
             out[:, i] = out[:, j]
-    return out
-
-
-def read_audio(path: Path, target_sr: int = TARGET_SR) -> np.ndarray:
-    """Read audio file and return mono float32 numpy array at target_sr.
-
-    Returns shape (L,) with values in float32.
-    Supports: wav/mp3/flac/ogg/m4a via soundfile/torchaudio, and MUSDB .stem.mp4 via stempeg.
-    """
-    path = Path(path)
-    ext = path.suffix.lower()
-
-    # Special case: MUSDB stem file
-    if ext == ".mp4" and path.name.endswith(".stem.mp4"):
-        if not _have_stempeg:
-            raise RuntimeError("Reading .stem.mp4 requires `stempeg`. Install it and try again.")
-        # stems: (S, T, C); typical S=5 with [mixture, vocals, drums, bass, other]
-        stems, sr = stempeg.read_stems(str(path), dtype=np.float32)
-        # Prefer explicit mixture if present (S>=1), else sum sources
-        if stems.ndim == 3 and stems.shape[0] >= 1:
-            mix = stems[0]  # (T, C)
-        else:
-            mix = stems.sum(axis=0)  # (T, C)
-        if mix.ndim == 2 and mix.shape[1] > 1:
-            mix_mono = np.mean(mix, axis=1)
-        else:
-            mix_mono = mix.squeeze()
-        wave = _resample_np_mono(mix_mono, sr, target_sr)
-        return wave.astype(np.float32, copy=False)
-
-    # Generic audio via soundfile
-    if _have_soundfile:
-        data, sr = sf.read(str(path), always_2d=True)
-        data = data.T  # (C, L)
-        if data.shape[0] > 1:
-            data = np.mean(data, axis=0, keepdims=True)
-        data = data.squeeze(0)
-        data = _resample_np_mono(data, sr, target_sr)
-        return data.astype(np.float32, copy=False)
-
-    # Fallback via torchaudio
-    if _have_torchaudio:
-        wav, sr = torchaudio.load(str(path))  # (C, L)
-        wav = wav.mean(dim=0)
-        if sr != target_sr:
-            wav = torchaudio.functional.resample(wav.unsqueeze(0), orig_freq=sr, new_freq=target_sr)
-            wav = wav.squeeze(0)
-        return wav.numpy().astype(np.float32)
-
-    raise RuntimeError("No audio backend available: install soundfile (pysoundfile) or torchaudio or stempeg for .stem.mp4")
-
-
-def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # data: 1D numpy
-    if _have_soundfile:
-        sf.write(str(path), data, sr)
-        return
-    if _have_torchaudio:
-        wav = torch.from_numpy(data).unsqueeze(0)
-        torchaudio.save(str(path), wav, sample_rate=sr)
-        return
-    raise RuntimeError("No audio backend available for writing: install soundfile or torchaudio")
+    return out.astype(np.float32, copy=False)
 
 
 def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
     ckpt = torch.load(str(ckpt_path), map_location="cpu")
     n_sources = len(SOURCES)
-    model = UNet1D(n_sources=n_sources, base=64)
+    model = Unet2DWrapper(stem_names=list(SOURCES))
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()
@@ -203,21 +223,20 @@ def separate_file(model: torch.nn.Module, path: Path, out_dir: Path, device: tor
                   chunk_seconds: float, overlap_seconds: float, amp: bool):
     name = path.stem
     print(f"Processing: {path} -> {out_dir / name}")
-    wav = read_audio(path, TARGET_SR)
+    wav = read_audio(path, TARGET_SR)  # (C, L)
     wav = wav.astype(np.float32)
-    # Chunked separation
+
     try:
         sources = separate_chunked(model, wav, TARGET_SR, device, chunk_seconds, overlap_seconds, amp)  # (S, L)
     except RuntimeError as e:
-        # Fallback to CPU if CUDA OOM
         if "CUDA out of memory" in str(e) and device.type == "cuda":
             print("CUDA OOM encountered. Falling back to CPU for this file...")
             cpu_device = torch.device("cpu")
             sources = separate_chunked(model.to(cpu_device), wav, TARGET_SR, cpu_device, chunk_seconds, overlap_seconds, amp)
-            model.to(device)  # move back
+            model.to(device)
         else:
             raise
-    # Save per source
+
     for i, src in enumerate(SOURCES):
         out_path = out_dir / name / f"{src}.wav"
         data = sources[i]

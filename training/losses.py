@@ -133,6 +133,24 @@ def l1_loss(preds: torch.Tensor, targets: torch.Tensor, reduction: str = "mean")
         return F.l1_loss(preds, targets, reduction="none")
 
 
+def l2_loss(preds: torch.Tensor, targets: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """L2 loss that handles mismatched time lengths and common shapes.
+
+    Args:
+        reduction: 'mean' (default) or 'sum' or 'none'.
+    """
+    L = min(preds.shape[-1], targets.shape[-1])
+    preds = preds[..., :L]
+    targets = targets[..., :L]
+
+    if reduction == "mean":
+        return F.mse_loss(preds, targets)
+    elif reduction == "sum":
+        return F.mse_loss(preds, targets, reduction="sum")
+    else:
+        return F.mse_loss(preds, targets, reduction="none")
+
+
 def mrstft_loss(preds: torch.Tensor, targets: torch.Tensor,
                 ffts: Iterable[Tuple[int, int, int]] | None = None) -> torch.Tensor:
     """
@@ -182,6 +200,8 @@ def get_loss_fn(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     name = name.lower()
     if name == 'l1':
         return lambda p, t: l1_loss(p, t, reduction="mean")
+    if name == 'l2':
+        return lambda p, t: l2_loss(p, t, reduction="mean")
     if name == 'si_sdr':
         return si_sdr_loss
     if name == 'mrstft':

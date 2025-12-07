@@ -8,9 +8,9 @@ from torch.utils.data import DataLoader
 import numpy as np
 import random
 
+from models.unet2d.model import Unet2DWrapper
 from training.data import MusdbRandomChunks
 from training.evaluate import evaluate
-from training.model import UNet1D, apply_masks
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
 from training.losses import get_loss_fn
 
@@ -64,19 +64,46 @@ def seed_worker(worker_id):
 
 
 def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda):
-    mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C=1, L)
-    targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C=1, L)
+    mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C, L)
+    targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C, L)
+
+    if mixture.dim() != 3:
+        raise ValueError(f"Expected mixture of shape (B, C, L), got {mixture.shape}")
+    B, C, L = mixture.shape
+    if C == 1:
+        mixture_stereo = mixture.repeat(1, 2, 1)  # (B, 2, L)
+    elif C == 2:
+        mixture_stereo = mixture
+    else:
+        raise ValueError(f"Splitter expects 1 or 2 channels, got C={C}")
 
     optimizer.zero_grad(set_to_none=True)
     with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
-        masks = model(mixture)  # (B, S, Lm)
-        preds = apply_masks(mixture, masks)  # (B, S, 1, Lp)
+        pred_sources = []  # list of (S, 1, L_pred) per batch item
+        for b in range(B):
+            wav_stereo = mixture_stereo[b]  # (2, L)
+            out_dict = model.separate(wav_stereo)  # dict[name] -> (2, L_out)
+
+            stem_names = list(model.stems.keys())
+            stems_wave = [out_dict[name] for name in stem_names]
+            stems_wave = torch.stack(stems_wave, dim=0)  # (S, 2, L_out)
+
+            # Downmix to mono to compare with mono targets (C=1)
+            stems_mono = stems_wave.mean(dim=1, keepdim=True)  # (S, 1, L_out)
+            pred_sources.append(stems_mono)
+
+        preds = torch.stack(pred_sources, dim=0)  # (B, S, 1, L_out)
+
+        # Align time length between preds and targets
         Lp = preds.shape[-1]
-        targets_c = targets[..., :Lp]  # match length
-        loss = loss_fn(preds, targets_c)
+        Lt = targets.shape[-1]
+        Lc = min(Lp, Lt)
+        preds_c = preds[..., :Lc]
+        targets_c = targets[..., :Lc]
+
+        loss = loss_fn(preds_c, targets_c)
 
     scaler.scale(loss).backward()
-
     scaler.step(optimizer)
     scaler.update()
     ema.update(model)
@@ -170,7 +197,7 @@ def train(
         generator=g,
     )
 
-    model = UNet1D(n_sources=len(sources), base=64).to(device)
+    model = Unet2DWrapper(stem_names=list(sources)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     ema = EMA(model, decay=0.999)
@@ -262,8 +289,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
     parser.add_argument("--loss", type=str, default="si_sdr_l1",
-                        choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
-                        help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
+                        choices=["l1", "l2", "si_sdr", "mrstft", "si_sdr_l1"],
+                        help="Loss to use: l1, l2, si_sdr, mrstft, si_sdr_l1 (hybrid)")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
 
     args = parser.parse_args()
