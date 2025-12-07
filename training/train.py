@@ -143,6 +143,16 @@ def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment
     return metrics
 
 
+def prune_previous_checkpoint(ckpt_dir: Path, current_epoch: int, ckpt_every: int):
+    target_epoch = current_epoch - ckpt_every
+    if target_epoch <= 0:
+        return
+    old_path = ckpt_dir / f"epoch_{target_epoch:04d}.pt"
+    if old_path.exists():
+        old_path.unlink()
+        print(f"[CKPT] Removed old checkpoint: {old_path}")
+
+
 def train(
         data_root: str = "./musdb18-wav",
         data_format: str = "wav",
@@ -160,6 +170,7 @@ def train(
         resume: str | None = None,
         loss_name: str = "si_sdr_l1",
         eval_every: int = 5,
+        prune_checkpoints: bool = False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
@@ -256,8 +267,15 @@ def train(
 
         if epoch % ckpt_every == 0:
             path = ckpt_dir / f"epoch_{epoch:04d}.pt"
-            save_checkpoint(path, model, optimizer, epoch, step, scaler)
-            print(f"[CKPT] Saved checkpoint: {path}")
+            try:
+                save_checkpoint(path, model, optimizer, epoch, step, scaler)
+            except Exception as exc:
+                print(f"[CKPT] Failed to save checkpoint {path}: {exc}")
+                raise
+            else:
+                print(f"[CKPT] Saved checkpoint: {path}")
+                if prune_checkpoints and path.exists():
+                    prune_previous_checkpoint(ckpt_dir, epoch, ckpt_every)
 
     # Final save
     ckpt_path = ckpt_dir / f"final_step_{step:06d}.pt"
@@ -292,6 +310,8 @@ if __name__ == "__main__":
                         choices=["l1", "l2", "si_sdr", "mrstft", "si_sdr_l1"],
                         help="Loss to use: l1, l2, si_sdr, mrstft, si_sdr_l1 (hybrid)")
     parser.add_argument("--eval_every", type=int, default=5, help="Evaluate every N epochs")
+    parser.add_argument("--prune_checkpoints", action="store_true",
+                        help="Delete the previous scheduled checkpoint each time a new one is saved")
 
     args = parser.parse_args()
 
@@ -313,4 +333,5 @@ if __name__ == "__main__":
         resume=args.resume,
         loss_name=args.loss,
         eval_every=args.eval_every,
+        prune_checkpoints=args.prune_checkpoints,
     )
