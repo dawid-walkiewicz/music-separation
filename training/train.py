@@ -63,21 +63,9 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level):
-    times = {}
-
-    if use_cuda and log_level == 2:
-        torch.cuda.synchronize()
-
-    if log_level == 2:
-        start = time.monotonic()
-
+def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda):
     mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C=1, L)
     targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C=1, L)
-
-    if log_level == 2:
-        times["data"] = time.monotonic() - start
-        start = time.monotonic()
 
     optimizer.zero_grad(set_to_none=True)
     with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
@@ -87,62 +75,24 @@ def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, 
         targets_c = targets[..., :Lp]  # match length
         loss = loss_fn(preds, targets_c)
 
-    if use_cuda and log_level == 2:
-        torch.cuda.synchronize()
-
-    if log_level == 2:
-        times["forward"] = time.monotonic() - start
-        start = time.monotonic()
-
     scaler.scale(loss).backward()
-
-    if use_cuda and log_level == 2:
-        torch.cuda.synchronize()
-
-    if log_level == 2:
-        times["backward"] = time.monotonic() - start
-        start = time.monotonic()
 
     scaler.step(optimizer)
     scaler.update()
     ema.update(model)
 
-    if use_cuda and log_level == 2:
-        torch.cuda.synchronize()
-
-    if log_level == 2:
-        times["optim"] = time.monotonic() - start
-
-    return float(loss.item()), times
+    return float(loss.item())
 
 
-def log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time):
+def log_status(epoch, running_loss, log_every , epoch_size, last_log_time):
     avg_loss = running_loss / (log_every * epoch_size)
 
     current_time = time.monotonic()
     total_duration_wall = current_time - last_log_time
     steps_per_sec = (log_every * epoch_size) / total_duration_wall
 
-    log_parts = []
-
-    if log_level >= 1:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_parts.append(f"[{timestamp}]")
-
-    log_parts.append(f"Epoch {epoch:6d}")
-    log_parts.append(f"Avg Loss: {avg_loss:.5f}")
-    log_parts.append(f"{steps_per_sec:.2f} steps/s")
-
-    print(f"\n{' | '.join(log_parts)}")
-
-    if log_level == 2:
-        total_measured_ms = reduce(lambda a, b: a + b,
-                                      [val / log_every * 1000 for val in log_times.values()])
-        print(f"  Average times per step (total measured: {total_measured_ms:.2f} ms):")
-
-        if total_measured_ms > 0:
-            for key, val in log_times.items():
-                print(f"    - {key.capitalize():10s}: {val / log_every * 1000:8.2f} ms")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] | Epoch {epoch:6d} | Avg Loss: {avg_loss:.5f} | {steps_per_sec:.2f} steps/s")
 
     return current_time
 
@@ -181,7 +131,6 @@ def train(
         sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
         seed: int = 42,
         resume: str | None = None,
-        log_level: int = 0,
         loss_name: str = "si_sdr_l1",
         eval_every: int = 5,
 ):
@@ -254,27 +203,21 @@ def train(
     running_loss = 0.0
     best_si_sdr = -float("inf")
 
-    log_times = {"data": 0, "forward": 0, "backward": 0, "optim": 0}
     last_log_time = time.monotonic()
 
     for epoch in range(start_epoch + 1, epochs + 1):
         for i, batch in enumerate(loader, start=1):
             step += 1
 
-            loss, t = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda, log_level)
+            loss = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda)
             running_loss += loss
-
-            if log_level == 2:
-                for key in log_times.keys():
-                    log_times[key] += t[key]
 
             if i >= epoch_size:
                 break
 
         if epoch % log_every == 0:
-            last_log_time = log_status(epoch, running_loss, log_times, log_every, log_level, epoch_size, last_log_time)
+            last_log_time = log_status(epoch, running_loss, log_every, epoch_size, last_log_time)
             running_loss = 0.0
-            log_times = {k: 0.0 for k in log_times}
 
         if epoch % eval_every == 0:
             metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds)
@@ -318,8 +261,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4, help="Number of DataLoader workers")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
-    parser.add_argument("--log_level", type=int, default=0, choices=[0, 1, 2],
-                        help="Logging level: 0 (minimal), 1 (+timestamp), 2 (detailed timings, worse performance)")
     parser.add_argument("--loss", type=str, default="si_sdr_l1",
                         choices=["l1", "si_sdr", "mrstft", "si_sdr_l1"],
                         help="Loss to use: l1, si_sdr, mrstft, si_sdr_l1 (hybrid)")
@@ -343,7 +284,6 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         seed=args.seed,
         resume=args.resume,
-        log_level=args.log_level,
         loss_name=args.loss,
         eval_every=args.eval_every,
     )
