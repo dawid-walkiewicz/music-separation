@@ -1,14 +1,16 @@
-from functools import reduce
 from pathlib import Path
 import time
 from datetime import datetime
+from typing import cast, Dict
 
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader
 import numpy as np
 import random
 
 from models.unet2d.model import Unet2DWrapper
+from models.unet2d.train_step import train_step
 from training.data import MusdbRandomChunks
 from training.evaluate import evaluate
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
@@ -63,55 +65,7 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda):
-    mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C, L)
-    targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C, L)
-
-    if mixture.dim() != 3:
-        raise ValueError(f"Expected mixture of shape (B, C, L), got {mixture.shape}")
-    B, C, L = mixture.shape
-    if C == 1:
-        mixture_stereo = mixture.repeat(1, 2, 1)  # (B, 2, L)
-    elif C == 2:
-        mixture_stereo = mixture
-    else:
-        raise ValueError(f"Splitter expects 1 or 2 channels, got C={C}")
-
-    optimizer.zero_grad(set_to_none=True)
-    with torch.amp.autocast(device_type="cuda", enabled=use_cuda):
-        pred_sources = []  # list of (S, 1, L_pred) per batch item
-        for b in range(B):
-            wav_stereo = mixture_stereo[b]  # (2, L)
-            out_dict = model.separate(wav_stereo)  # dict[name] -> (2, L_out)
-
-            stem_names = list(model.stems.keys())
-            stems_wave = [out_dict[name] for name in stem_names]
-            stems_wave = torch.stack(stems_wave, dim=0)  # (S, 2, L_out)
-
-            # Downmix to mono to compare with mono targets (C=1)
-            stems_mono = stems_wave.mean(dim=1, keepdim=True)  # (S, 1, L_out)
-            pred_sources.append(stems_mono)
-
-        preds = torch.stack(pred_sources, dim=0)  # (B, S, 1, L_out)
-
-        # Align time length between preds and targets
-        Lp = preds.shape[-1]
-        Lt = targets.shape[-1]
-        Lc = min(Lp, Lt)
-        preds_c = preds[..., :Lc]
-        targets_c = targets[..., :Lc]
-
-        loss = loss_fn(preds_c, targets_c)
-
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-    ema.update(model)
-
-    return float(loss.item())
-
-
-def log_status(epoch, running_loss, log_every , epoch_size, last_log_time):
+def log_status(epoch, running_loss, log_every, epoch_size, last_log_time):
     avg_loss = running_loss / (log_every * epoch_size)
 
     current_time = time.monotonic()
@@ -243,8 +197,10 @@ def train(
 
     last_log_time = time.monotonic()
 
+    epoch = 0
     for epoch in range(start_epoch + 1, epochs + 1):
         for i, batch in enumerate(loader, start=1):
+            batch = cast(Dict[str, Tensor], cast(object, batch))
             step += 1
 
             loss = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda)

@@ -1,4 +1,5 @@
-from typing import Callable, Iterable, Tuple, Optional
+from typing import Iterable, Tuple, Optional
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
