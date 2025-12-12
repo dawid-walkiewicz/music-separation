@@ -144,7 +144,7 @@ def train(
         sources=list(sources),
         segment_seconds=segment_seconds,
         items_per_epoch=10_000,
-        mono=True,
+        mono=False,
         seed=seed,
     )
 
