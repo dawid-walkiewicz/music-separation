@@ -9,16 +9,15 @@ from models.unet2d.model import Unet2DWrapper
 
 def train_step(
     model: Unet2DWrapper,
-    batch: Dict[str, Tensor],
+    batch: Dict[str, object],
     optimizer: Optimizer,
     scaler: GradScaler,
-    ema: Any,
     loss_fn: Callable[[Tensor, Tensor], Tensor],
     device: torch.device,
     use_cuda: bool,
 ) -> float:
     mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C, L)
-    targets = batch["targets"].to(device, non_blocking=True)  # (B, S, C, L)
+    targets_dict = batch["targets"]  # Dict[str, Tensor] with shape (B, C, L) per stem
 
     if mixture.dim() != 3:
         raise ValueError(f"Expected mixture of shape (B, C, L), got {mixture.shape}")
@@ -29,9 +28,6 @@ def train_step(
         mixture_stereo = mixture
     else:
         raise ValueError(f"Splitter expects 1 or 2 channels, got C={C}")
-
-    stem_names = list(model.stems.keys())
-    stem_to_idx = {name: i for i, name in enumerate(stem_names)}
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -45,13 +41,12 @@ def train_step(
             masked_stfts = model.forward(wav_stereo)  # dict[name -> (2, F, T, 1) complex]
 
             for stem_name, pred_stft in masked_stfts.items():
-                if stem_name not in stem_to_idx:
+                if stem_name not in targets_dict:
                     raise KeyError(
-                        f"Stem '{stem_name}' returned by model.forward is not in model.stems: {stem_names}"
+                        f"Stem '{stem_name}' returned by model.forward is not in dataset targets: {list(targets_dict.keys())}"
                     )
 
-                stem_idx = stem_to_idx[stem_name]
-                target_wave = targets[b, stem_idx]  # (C, L)
+                target_wave = targets_dict[stem_name][b].to(device, non_blocking=True)  # (C, L)
 
                 if target_wave.dim() != 2:
                     raise ValueError(f"Expected target of shape (C, L), got {target_wave.shape}")
@@ -87,6 +82,5 @@ def train_step(
     scaler.scale(total_loss).backward()
     scaler.step(optimizer)
     scaler.update()
-    ema.update(model)
 
     return float(total_loss.item())

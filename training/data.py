@@ -99,7 +99,7 @@ class MusdbRandomChunks(Dataset):
         track.chunk_start = start_sample / self.sample_rate
         track.chunk_duration = self.segment_seconds
 
-        target_list = []
+        target_dict: Dict[str, torch.Tensor] = {}
         for src in self.sources:
             audio = track.sources[src].audio
             audio = self._ensure_channels_first(audio)
@@ -112,14 +112,13 @@ class MusdbRandomChunks(Dataset):
             if audio.shape[1] > self.segment_samples:
                 audio = audio[:, :self.segment_samples]
 
-            target_list.append(self._to_tensor(audio))  # (C, L)
+            target_dict[src] = self._to_tensor(audio)  # (C, L)
 
-        stacked = torch.stack(target_list, dim=0) # (S, C, L)
-        mixture = stacked.sum(dim=0) # (C, L)
-
-        targets = stacked
+        # Build mixture as sum of all requested stems
+        stacked = torch.stack(list(target_dict.values()), dim=0)  # (S, C, L)
+        mixture = stacked.sum(dim=0)  # (C, L)
 
         return {
             "mixture": mixture,
-            "targets": targets,
+            "targets": target_dict,
         }

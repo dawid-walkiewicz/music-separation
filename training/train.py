@@ -12,42 +12,11 @@ import random
 from models.unet2d.model import Unet2DWrapper
 from models.unet2d.train_step import train_step
 from training.data import MusdbRandomChunks
-from training.evaluate import evaluate
+from models.unet2d.eval import evaluate as eval_unet
 from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
 from training.losses import get_loss_fn
 
 torch.backends.cudnn.benchmark = True
-
-
-class EMA:
-    """Simple Exponential Moving Average for stabilizing evaluation."""
-
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
-        self.decay = decay
-        self.shadow = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.detach().clone()
-
-        self.buffers = {name: buf.detach().clone() for name, buf in model.named_buffers()}
-
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1 - self.decay)
-
-    @torch.no_grad()
-    def copy_to(self, model: torch.nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.shadow[name])
-
-        for name, buf in model.named_buffers():
-            if name in self.buffers:
-                buf.copy_(self.buffers[name])
-
 
 def seed_worker(worker_id):
     """
@@ -78,22 +47,29 @@ def log_status(epoch, running_loss, log_every, epoch_size, last_log_time):
     return current_time
 
 
-def run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds):
-    print("\n[Eval] Copying EMA weights and computing metrics on the validation set...")
-
+def run_eval(epoch, model, device, data_root, sources, segment_seconds):
     backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    ema.copy_to(model)
-    metrics = evaluate(
+
+    metrics = eval_unet(
         model,
         data_root=data_root,
-        data_format=data_format,
-        sources=sources,
+        sources=list(sources),
         segment_seconds=segment_seconds,
         device=device,
-        max_batches=20,
+        subset="test",
+        batch_size=4,
+        num_workers=4,
     )
+
     model.load_state_dict(backup)
-    print(f"[Eval] Epoch {epoch:6d} | SDR: {metrics['sdr']:.2f} dB | SI-SDR: {metrics['si_sdr']:.2f} dB")
+
+    if metrics:
+        print(f"[Eval] Epoch {epoch:6d} | Metrics:")
+        for key in sorted(metrics.keys()):
+            print(f"    {key:16s}: {metrics[key]:8.3f}")
+    else:
+        print(f"[Eval] Epoch {epoch:6d} | No metrics returned from eval_unet")
+
     return metrics
 
 
@@ -119,7 +95,7 @@ def train(
         ckpt_every: int = 10,
         segment_seconds: float = 6.0,
         num_workers: int = 4,
-        sources: tuple[str, ...] = ("vocals", "drums", "bass", "other"),
+        sources: list[str] = ["vocals", "drums", "bass", "other"],
         seed: int = 42,
         resume: str | None = None,
         loss_name: str = "si_sdr_l1",
@@ -141,7 +117,7 @@ def train(
         root=data_root,
         data_format=data_format,
         subset="train",
-        sources=list(sources),
+        sources=sources,
         segment_seconds=segment_seconds,
         items_per_epoch=10_000,
         mono=False,
@@ -162,10 +138,9 @@ def train(
         generator=g,
     )
 
-    model = Unet2DWrapper(stem_names=list(sources)).to(device)
+    model = Unet2DWrapper(stem_names=sources).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
-    ema = EMA(model, decay=0.999)
 
     loss_fn = get_loss_fn(loss_name)
     print(f"Using loss: {loss_name}")
@@ -200,10 +175,9 @@ def train(
     epoch = 0
     for epoch in range(start_epoch + 1, epochs + 1):
         for i, batch in enumerate(loader, start=1):
-            batch = cast(Dict[str, Tensor], cast(object, batch))
             step += 1
 
-            loss = train_step(model, batch, optimizer, scaler, ema, loss_fn, device, use_cuda)
+            loss = train_step(model, batch, optimizer, scaler, loss_fn, device, use_cuda)
             running_loss += loss
 
             if i >= epoch_size:
@@ -214,12 +188,8 @@ def train(
             running_loss = 0.0
 
         if epoch % eval_every == 0:
-            metrics = run_eval(epoch, model, ema, device, data_root, data_format, sources, segment_seconds)
-            if metrics["si_sdr"] > best_si_sdr:
-                best_si_sdr = metrics["si_sdr"]
-                best_ckpt = ckpt_dir / "best_sisdr.pt"
-                save_checkpoint(best_ckpt, model, optimizer, step, epoch, scaler)
-                print(f"[Eval] New best model (SI-SDR={best_si_sdr:.2f} dB) has been saved to {best_ckpt}")
+            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds)
+            current_si_sdr = metrics.get("si_sdr/mean", float("-inf"))            
 
         if epoch % ckpt_every == 0:
             path = ckpt_dir / f"epoch_{epoch:04d}.pt"
