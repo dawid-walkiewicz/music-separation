@@ -22,6 +22,12 @@ DEFAULT_N_FFT = 4096
 DEFAULT_HOP_LENGTH = 1024
 
 
+def _ensure_mono(wave: np.ndarray) -> np.ndarray:
+    """Collapse any channel dimension to mono while keeping time dimension intact."""
+    arr = np.asarray(wave)
+    return arr.mean(axis=-2, keepdims=True) if arr.ndim >= 2 else arr
+
+
 def load_model(ckpt_path: Path, stem_names: Sequence[str], device: torch.device) -> Unet2DWrapper:
     state = torch.load(str(ckpt_path), map_location="cpu")
     if "model" not in state:
@@ -33,18 +39,7 @@ def load_model(ckpt_path: Path, stem_names: Sequence[str], device: torch.device)
     return model
 
 
-def prepare_mixture_for_model(mixture: torch.Tensor) -> torch.Tensor:
-    if mixture.dim() != 2:
-        raise ValueError(f"Mixture tensor must have shape (C, L), got {mixture.shape}")
-    if mixture.size(0) == 1:
-        mixture = mixture.repeat(2, 1)
-    elif mixture.size(0) > 2:
-        mixture = mixture[:2]
-    return mixture
-
-
 def separate_sources(model: Unet2DWrapper, mixture: torch.Tensor, device: torch.device) -> np.ndarray:
-    mixture = prepare_mixture_for_model(mixture)
     mixture = mixture.to(device)
     with torch.no_grad():
         out = model.separate(mixture)
@@ -145,7 +140,7 @@ def run_demo(args):
         subset="train",
         segment_seconds=args.segment_seconds,
         items_per_epoch=args.samples,
-        mono=True,
+        mono=False,
         seed=args.seed,
     )
 
@@ -161,6 +156,9 @@ def run_demo(args):
 
         mixture_np = mixture.numpy()
         targets_np = targets.numpy()
+
+        mixture_np = _ensure_mono(mixture_np)
+        targets_np = _ensure_mono(targets_np)
 
         print(f"Saving spectrograms for sample {idx + 1}/{args.samples}")
         title = f"Sample {idx + 1}"
