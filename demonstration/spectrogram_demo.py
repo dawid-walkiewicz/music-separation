@@ -50,6 +50,12 @@ def separate_sources(model: Unet2DWrapper, mixture: torch.Tensor, device: torch.
     return preds
 
 
+def _stack_targets(targets_obj, stem_names: Sequence[str]) -> torch.Tensor:
+    if isinstance(targets_obj, dict):
+        return torch.stack([targets_obj[name] for name in stem_names], dim=0)
+    return targets_obj
+
+
 def _log_spectrogram(wave: np.ndarray, sr: int, n_fft: int, hop: int, window: torch.Tensor) -> np.ndarray:
     wave = np.asarray(wave)
     wave = np.squeeze(wave)
@@ -151,7 +157,7 @@ def run_demo(args):
     for idx in range(args.samples):
         sample = dataset[idx]
         mixture = sample["mixture"].clone()
-        targets = sample["targets"].clone()
+        targets = _stack_targets(sample["targets"], DEFAULT_SOURCES).clone()
         preds = separate_sources(model, mixture, device)
 
         mixture_np = mixture.numpy()

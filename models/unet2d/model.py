@@ -30,7 +30,7 @@ class Unet2DWrapper(nn.Module):
 
         assert stem_names, "Must provide stem names."
         # stft config
-        self.F = 1024
+        self.F = 2048
         self.T = 512
         self.win_length = 4096
         self.hop_length = 1024
