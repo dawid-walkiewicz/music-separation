@@ -26,7 +26,7 @@ def batchify(tensor: Tensor, T: int) -> Tensor:
 
 class Unet2DWrapper(nn.Module):
     def __init__(self, stem_names: List[str] = None):
-        super(Unet2DWrapper, self).__init__()
+        super().__init__()
 
         assert stem_names, "Must provide stem names."
         # stft config
@@ -48,10 +48,8 @@ class Unet2DWrapper(nn.Module):
             stft: complex tensor of shape (2, F, L, 1) truncated to self.F frequencies.
             mag:  magnitude tensor of shape (2, F, L).
         """
-        # Ensure shape is (2, L)
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)  # (1, L)
-        # torch.stft with return_complex=True (recommended, future-proof)
         stft_c = torch.stft(
             wav,
             n_fft=self.win_length,

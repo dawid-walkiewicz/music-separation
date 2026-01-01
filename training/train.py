@@ -1,10 +1,8 @@
 from pathlib import Path
 import time
 from datetime import datetime
-from typing import cast, Dict
 
 import torch
-from torch import Tensor
 from torch.utils.data import DataLoader
 import numpy as np
 import random
@@ -48,7 +46,7 @@ def log_status(epoch, running_loss, log_every, epoch_size, last_log_time):
 
 
 def run_eval(epoch, model, device, data_root, sources, segment_seconds):
-    backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    model.eval()
 
     metrics = eval_unet(
         model,
@@ -61,11 +59,11 @@ def run_eval(epoch, model, device, data_root, sources, segment_seconds):
         num_workers=4,
     )
 
-    model.load_state_dict(backup)
+    model.train()
 
     if metrics:
         print(f"[Eval] Epoch {epoch:6d} | Metrics:")
-        for key in sorted(metrics.keys()):
+        for key in metrics.keys():
             print(f"    {key:16s}: {metrics[key]:8.3f}")
     else:
         print(f"[Eval] Epoch {epoch:6d} | No metrics returned from eval_unet")
@@ -85,7 +83,6 @@ def prune_previous_checkpoint(ckpt_dir: Path, current_epoch: int, ckpt_every: in
 
 def train(
         data_root: str = "./musdb18-wav",
-        data_format: str = "wav",
         workdir: str = "./runs/unet1d",
         batch_size: int = 4,
         lr: float = 2e-4,
@@ -115,7 +112,6 @@ def train(
 
     dataset = MusdbRandomChunks(
         root=data_root,
-        data_format=data_format,
         subset="train",
         sources=sources,
         segment_seconds=segment_seconds,
@@ -214,13 +210,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train a 1D U-Net for audio source separation (MUSDB18)")
     parser.add_argument("--data_root", type=str, default="./musdb18-wav")
-    parser.add_argument(
-        "--data_format",
-        type=str,
-        default="wav",
-        choices=["wav", "stem"],
-        help="Input data format for MUSDB18: 'wav' (default) or 'stem'.",
-    )
     parser.add_argument("--workdir", type=str, default="./runs/unet1d")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -245,7 +234,6 @@ if __name__ == "__main__":
 
     train(
         data_root=args.data_root,
-        data_format=args.data_format,
         workdir=args.workdir,
         batch_size=args.batch_size,
         lr=args.lr,

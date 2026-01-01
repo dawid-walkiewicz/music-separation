@@ -92,6 +92,6 @@ class UNet(nn.Module):
                 x = up(encoder_outputs_pre_act.pop())
             else:
                 # merge skip connection
-                x = up(torch.concat([encoder_outputs_pre_act.pop(), x], axis=1))
+                x = up(torch.concat([encoder_outputs_pre_act.pop(), x], dim=1))
         mask = self.sigmoid(self.up_final(x))
-        return mask * input
+        return mask

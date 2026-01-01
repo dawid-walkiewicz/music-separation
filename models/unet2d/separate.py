@@ -6,12 +6,12 @@ import sys
 import numpy as np
 import torch
 
+from models.audio_functions import process_input
 from models.unet2d.model import Unet2DWrapper
 
 _have_soundfile = False
 _have_torchaudio = False
 _have_resampy = False
-_have_stempeg = False
 try:
     import soundfile as sf
     _have_soundfile = True
@@ -25,11 +25,6 @@ except Exception:
 try:
     import resampy
     _have_resampy = True
-except Exception:
-    pass
-try:
-    import stempeg
-    _have_stempeg = True
 except Exception:
     pass
 
@@ -54,32 +49,10 @@ def read_audio(path: Path, target_sr: int = TARGET_SR) -> np.ndarray:
     """Read audio file and return mono or stereo float32 numpy array at target_sr.
 
     Returns shape (C, L) with values in float32. C can be 1 or 2.
-    Supports: wav/mp3/flac/ogg/m4a via soundfile/torchaudio, and MUSDB .stem.mp4 via stempeg.
+    Supports: wav/mp3/flac/ogg/m4a via soundfile/torchaudio.
     """
     path = Path(path)
-    ext = path.suffix.lower()
 
-    # Special case: MUSDB stem file
-    if ext == ".mp4" and path.name.endswith(".stem.mp4"):
-        if not _have_stempeg:
-            raise RuntimeError("Reading .stem.mp4 requires `stempeg`. Install it and try again.")
-        stems, sr = stempeg.read_stems(str(path), dtype=np.float32)  # (S, T, C)
-        if stems.ndim == 3 and stems.shape[0] >= 1:
-            mix = stems[0]  # (T, C)
-        else:
-            mix = stems.sum(axis=0)  # (T, C)
-        mix = mix.T  # (C, L)
-        if sr != target_sr:
-            if mix.shape[0] > 1:
-                mix_res = []
-                for ch in range(mix.shape[0]):
-                    mix_res.append(_resample_np_mono(mix[ch], sr, target_sr))
-                mix = np.stack(mix_res, axis=0)
-            else:
-                mix = _resample_np_mono(mix.squeeze(0), sr, target_sr)[None, :]
-        return mix.astype(np.float32, copy=False)
-
-    # Generic audio via soundfile
     if _have_soundfile:
         data, sr = sf.read(str(path), always_2d=True)  # (L, C)
         data = data.T  # (C, L)
@@ -100,7 +73,7 @@ def read_audio(path: Path, target_sr: int = TARGET_SR) -> np.ndarray:
             wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
         return wav.numpy().astype(np.float32)
 
-    raise RuntimeError("No audio backend available: install soundfile (pysoundfile) or torchaudio or stempeg for .stem.mp4")
+    raise RuntimeError("No audio backend available: install soundfile (pysoundfile) or torchaudio")
 
 
 def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
@@ -211,55 +184,11 @@ def separate_chunked(model: torch.nn.Module,
 
 def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
     ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    n_sources = len(SOURCES)
     model = Unet2DWrapper(stem_names=list(SOURCES))
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()
     return model
-
-
-def separate_file(model: torch.nn.Module, path: Path, out_dir: Path, device: torch.device,
-                  chunk_seconds: float, overlap_seconds: float, amp: bool):
-    name = path.stem
-    print(f"Processing: {path} -> {out_dir / name}")
-    wav = read_audio(path, TARGET_SR)  # (C, L)
-    wav = wav.astype(np.float32)
-
-    try:
-        sources = separate_chunked(model, wav, TARGET_SR, device, chunk_seconds, overlap_seconds, amp)  # (S, L)
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e) and device.type == "cuda":
-            print("CUDA OOM encountered. Falling back to CPU for this file...")
-            cpu_device = torch.device("cpu")
-            sources = separate_chunked(model.to(cpu_device), wav, TARGET_SR, cpu_device, chunk_seconds, overlap_seconds, amp)
-            model.to(device)
-        else:
-            raise
-
-    for i, src in enumerate(SOURCES):
-        out_path = out_dir / name / f"{src}.wav"
-        data = sources[i]
-        maxv = float(np.max(np.abs(data)))
-        if maxv > 0:
-            data = data / maxv * 0.99
-        write_audio(out_path, data, TARGET_SR)
-
-
-def process_input(model: torch.nn.Module, input_path: Path, out_root: Path, device: torch.device,
-                  chunk_seconds: float, overlap_seconds: float, amp: bool):
-    if input_path.is_dir():
-        exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".stem.mp4"}
-        files = [p for p in sorted(input_path.iterdir()) if (p.suffix.lower() in exts) or p.name.endswith(".stem.mp4")]
-        if not files:
-            print(f"No audio files found in {input_path}")
-            return
-        for p in files:
-            separate_file(model, p, out_root, device, chunk_seconds, overlap_seconds, amp)
-    elif input_path.is_file():
-        separate_file(model, input_path, out_root, device, chunk_seconds, overlap_seconds, amp)
-    else:
-        raise RuntimeError(f"Input path not found: {input_path}")
 
 
 def main(argv: list[str] | None = None):
@@ -288,7 +217,7 @@ def main(argv: list[str] | None = None):
 
     model = load_model_from_ckpt(ckpt_path, device)
     use_amp = (not args.no_amp)
-    process_input(model, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
+    process_input(model, read_audio, TARGET_SR, separate_chunked, SOURCES, write_audio, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
 
 
 if __name__ == "__main__":

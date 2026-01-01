@@ -5,6 +5,8 @@ import sys
 import torch
 import numpy as np
 
+from models.audio_functions import process_input
+
 # Ensure project root on sys.path for 'training' imports
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -17,7 +19,6 @@ from models.unet1d.model import UNet1D, apply_masks
 _have_soundfile = False
 _have_torchaudio = False
 _have_resampy = False
-_have_stempeg = False
 try:
     import soundfile as sf
     _have_soundfile = True
@@ -31,11 +32,6 @@ except Exception:
 try:
     import resampy
     _have_resampy = True
-except Exception:
-    pass
-try:
-    import stempeg
-    _have_stempeg = True
 except Exception:
     pass
 
@@ -131,30 +127,10 @@ def read_audio(path: Path, target_sr: int = TARGET_SR) -> np.ndarray:
     """Read audio file and return mono float32 numpy array at target_sr.
 
     Returns shape (L,) with values in float32.
-    Supports: wav/mp3/flac/ogg/m4a via soundfile/torchaudio, and MUSDB .stem.mp4 via stempeg.
+    Supports: wav/mp3/flac/ogg/m4a via soundfile/torchaudio
     """
     path = Path(path)
-    ext = path.suffix.lower()
 
-    # Special case: MUSDB stem file
-    if ext == ".mp4" and path.name.endswith(".stem.mp4"):
-        if not _have_stempeg:
-            raise RuntimeError("Reading .stem.mp4 requires `stempeg`. Install it and try again.")
-        # stems: (S, T, C); typical S=5 with [mixture, vocals, drums, bass, other]
-        stems, sr = stempeg.read_stems(str(path), dtype=np.float32)
-        # Prefer explicit mixture if present (S>=1), else sum sources
-        if stems.ndim == 3 and stems.shape[0] >= 1:
-            mix = stems[0]  # (T, C)
-        else:
-            mix = stems.sum(axis=0)  # (T, C)
-        if mix.ndim == 2 and mix.shape[1] > 1:
-            mix_mono = np.mean(mix, axis=1)
-        else:
-            mix_mono = mix.squeeze()
-        wave = _resample_np_mono(mix_mono, sr, target_sr)
-        return wave.astype(np.float32, copy=False)
-
-    # Generic audio via soundfile
     if _have_soundfile:
         data, sr = sf.read(str(path), always_2d=True)
         data = data.T  # (C, L)
@@ -173,7 +149,7 @@ def read_audio(path: Path, target_sr: int = TARGET_SR) -> np.ndarray:
             wav = wav.squeeze(0)
         return wav.numpy().astype(np.float32)
 
-    raise RuntimeError("No audio backend available: install soundfile (pysoundfile) or torchaudio or stempeg for .stem.mp4")
+    raise RuntimeError("No audio backend available: install soundfile (pysoundfile) or torchaudio")
 
 
 def write_audio(path: Path, data: np.ndarray, sr: int = TARGET_SR):
@@ -197,50 +173,6 @@ def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
     model.to(device)
     model.eval()
     return model
-
-
-def separate_file(model: torch.nn.Module, path: Path, out_dir: Path, device: torch.device,
-                  chunk_seconds: float, overlap_seconds: float, amp: bool):
-    name = path.stem
-    print(f"Processing: {path} -> {out_dir / name}")
-    wav = read_audio(path, TARGET_SR)
-    wav = wav.astype(np.float32)
-    # Chunked separation
-    try:
-        sources = separate_chunked(model, wav, TARGET_SR, device, chunk_seconds, overlap_seconds, amp)  # (S, L)
-    except RuntimeError as e:
-        # Fallback to CPU if CUDA OOM
-        if "CUDA out of memory" in str(e) and device.type == "cuda":
-            print("CUDA OOM encountered. Falling back to CPU for this file...")
-            cpu_device = torch.device("cpu")
-            sources = separate_chunked(model.to(cpu_device), wav, TARGET_SR, cpu_device, chunk_seconds, overlap_seconds, amp)
-            model.to(device)  # move back
-        else:
-            raise
-    # Save per source
-    for i, src in enumerate(SOURCES):
-        out_path = out_dir / name / f"{src}.wav"
-        data = sources[i]
-        maxv = float(np.max(np.abs(data)))
-        if maxv > 0:
-            data = data / maxv * 0.99
-        write_audio(out_path, data, TARGET_SR)
-
-
-def process_input(model: torch.nn.Module, input_path: Path, out_root: Path, device: torch.device,
-                  chunk_seconds: float, overlap_seconds: float, amp: bool):
-    if input_path.is_dir():
-        exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".stem.mp4"}
-        files = [p for p in sorted(input_path.iterdir()) if (p.suffix.lower() in exts) or p.name.endswith(".stem.mp4")]
-        if not files:
-            print(f"No audio files found in {input_path}")
-            return
-        for p in files:
-            separate_file(model, p, out_root, device, chunk_seconds, overlap_seconds, amp)
-    elif input_path.is_file():
-        separate_file(model, input_path, out_root, device, chunk_seconds, overlap_seconds, amp)
-    else:
-        raise RuntimeError(f"Input path not found: {input_path}")
 
 
 def main(argv: list[str] | None = None):
@@ -269,7 +201,7 @@ def main(argv: list[str] | None = None):
 
     model = load_model_from_ckpt(ckpt_path, device)
     use_amp = (not args.no_amp)
-    process_input(model, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
+    process_input(model, read_audio, TARGET_SR, separate_chunked, SOURCES, write_audio, input_path, out_root, device, args.chunk_seconds, args.overlap_seconds, use_amp)
 
 
 if __name__ == "__main__":

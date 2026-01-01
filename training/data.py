@@ -19,7 +19,6 @@ class MusdbRandomChunks(Dataset):
     def __init__(
             self,
             root: str = "./musdb18-wav",
-            data_format: str = "wav",
             subset: str = "train",
             sources: List[str] = ("vocals", "drums", "bass", "other"),
             sample_rate: int = 44100,
@@ -41,13 +40,12 @@ class MusdbRandomChunks(Dataset):
         self.db = musdb.DB(
             root=root,
             subsets=[subset],
-            is_wav=(data_format == "wav")
+            is_wav=True
         )
         self.tracks = list(iter(self.db))
         if len(self.tracks) == 0:
             raise RuntimeError(
                 f"No tracks found in {root} for subset={subset}. "
-                f"Make sure the MUSDB18 structure is correct and format={data_format}."
             )
 
         self.sources = list(sources)

@@ -4,6 +4,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+from models.audio_functions import ensure_stereo
+from models.unet2d.common_functions import ensure_target_wave_dims
 from models.unet2d.model import Unet2DWrapper
 from torchmetrics.audio import ScaleInvariantSignalDistortionRatio
 from training.data import MusdbRandomChunks
@@ -24,16 +26,7 @@ def _evaluate_batch(
     mixture = batch["mixture"].to(device, non_blocking=True)  # (B, C, L)
     targets_dict = batch["targets"]  # Dict[str, Tensor], already (B, C, L)
 
-    if mixture.dim() != 3:
-        raise ValueError(f"Expected mixture of shape (B, C, L), got {mixture.shape}")
-
-    B, C, L = mixture.shape
-    if C == 1:
-        mixture_stereo = mixture.repeat(1, 2, 1)  # (B, 2, L)
-    elif C == 2:
-        mixture_stereo = mixture
-    else:
-        raise ValueError(f"Splitter expects 1 or 2 channels, got C={C}")
+    mixture_stereo, B, L = ensure_stereo(mixture)
 
     si_sdr_per_stem: Dict[str, Tensor] = {name: torch.zeros((), device=device) for name in sources}
     count_per_stem: Dict[str, int] = {name: 0 for name in sources}
@@ -55,17 +48,7 @@ def _evaluate_batch(
                 pred_stft = masked_stfts[stem_name]
                 target_wave = targets_dict[stem_name][b].to(device, non_blocking=True)  # (C, L)
 
-                if target_wave.dim() != 2:
-                    raise ValueError(f"Expected target of shape (C, L), got {target_wave.shape}")
-                tC, tL = target_wave.shape
-                if tL != L:
-                    raise ValueError(
-                        f"Target and mixture length mismatch: target L={tL}, mix L={L}"
-                    )
-                if tC == 1:
-                    target_wave = target_wave.repeat(2, 1)
-                elif tC != 2:
-                    raise ValueError(f"Expected target with 1 or 2 channels, got C={tC}")
+                target_wave = ensure_target_wave_dims(target_wave, L)
 
                 pred_wave = model.inverse_stft(pred_stft)  # (2, L_pred)
 
@@ -74,8 +57,8 @@ def _evaluate_batch(
                     pred_wave = pred_wave[..., :min_len]
                     target_wave = target_wave[..., :min_len]
 
-                pred_in = pred_wave.unsqueeze(0)
-                target_in = target_wave.unsqueeze(0)
+                pred_in = pred_wave.unsqueeze(0) # (1, C, L)
+                target_in = target_wave.unsqueeze(0) # (1, C, L)
 
                 si_sdr_value = sisdr_metric(pred_in, target_in)
 
@@ -126,8 +109,6 @@ def evaluate(
     Returns:
         Dict[str, float]: aggregate SI-SDR metrics per stem and mean SI-SDR.
     """
-    model.eval()
-
     dataset = MusdbRandomChunks(
         root=data_root,
         subset=subset,

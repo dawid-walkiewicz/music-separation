@@ -108,8 +108,8 @@ def plot_stack(mixture: np.ndarray,
         ax_pred = fig.add_subplot(gs[row + 1, 1], sharex=mix_ax, sharey=mix_ax)
         axes_for_cb.extend([ax_tgt, ax_pred])
 
-        tgt = targets[row:row + 1]
-        pred = predictions[row:row + 1]
+        tgt = targets[row]
+        pred = predictions[row]
         tgt_spec = _log_spectrogram(tgt, sr, n_fft, hop, window)
         pred_spec = _log_spectrogram(pred, sr, n_fft, hop, window)
 
@@ -143,7 +143,7 @@ def run_demo(args):
 
     dataset = MusdbRandomChunks(
         root=args.data_root,
-        subset="train",
+        subset="test",
         segment_seconds=args.segment_seconds,
         items_per_epoch=args.samples,
         mono=False,
