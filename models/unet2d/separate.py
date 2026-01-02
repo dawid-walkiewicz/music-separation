@@ -151,7 +151,7 @@ def separate_chunked(model: torch.nn.Module,
             else:
                 out_dict = model.separate(chunk_tensor)
 
-        stem_names = list(model.stems.keys())
+        stem_names = list(model.stem_nets.keys())
         stems = [out_dict[name].cpu().numpy() for name in stem_names]  # list of (2, M_out)
         stems = np.stack(stems, axis=0)  # (S, 2, M_out)
         # Downmix to mono for writing / evaluation

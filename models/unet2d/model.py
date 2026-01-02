@@ -8,20 +8,21 @@ from torch.nn import functional as F
 from models.unet2d.unet import UNet
 
 
-def batchify(tensor: Tensor, T: int) -> Tensor:
+def pad_to_length(tensor: Tensor, target_length: int) -> Tensor:
     """
-    partition tensor into segments of length T, zero pad any ragged samples
+    Pads or cuts the input tensor to match the target length.
     Args:
-        tensor(Tensor): BxCxFxL
+        tensor (Tensor): Input tensor of shape (..., L).
+        target_length (int): Desired length .
     Returns:
-        tensor of size (B*[L/T] x C x F x T)
+        Tensor: Tensor of shape (..., target_length).
     """
-    # Zero pad the original tensor to an even multiple of T
     orig_size = tensor.size(-1)
-    new_size = math.ceil(orig_size / T) * T
-    tensor = F.pad(tensor, [0, new_size - orig_size])
-    # Partition the tensor into multiple samples of length T and stack them into a batch
-    return torch.cat(torch.split(tensor, T, dim=-1), dim=0)
+    if orig_size >= target_length:
+        return tensor[..., :target_length]
+    else:
+        pad_size = target_length - orig_size
+        return F.pad(tensor, [0, pad_size])
 
 
 class Unet2DWrapper(nn.Module):
@@ -31,25 +32,24 @@ class Unet2DWrapper(nn.Module):
         assert stem_names, "Must provide stem names."
         # stft config
         self.F = 2048
-        self.T = 512
+        self.T = 512  # ~11.6s of audio
         self.win_length = 4096
         self.hop_length = 1024
         self.win = nn.Parameter(torch.hann_window(self.win_length), requires_grad=False)
 
-        self.stems = nn.ModuleDict({name: UNet(in_channels=2) for name in stem_names})
+        self.stem_nets = nn.ModuleDict({name: UNet() for name in stem_names})
 
     def compute_stft(self, wav: Tensor) -> Tuple[Tensor, Tensor]:
-        """Computes STFT features from waveform.
+        """
+        Computes STFT features from waveform.
 
         Args:
-            wav (Tensor): shape (2, L) or (B, L). For Splitter we use stereo (2, L).
+            wav (Tensor): shape (2, L) or (B, L). We use stereo (2, L).
 
         Returns:
-            stft: complex tensor of shape (2, F, L, 1) truncated to self.F frequencies.
-            mag:  magnitude tensor of shape (2, F, L).
+            stft (Tensor): complex tensor of shape (2, F, L) truncated to self.F frequencies.
+            mag (Tensor):  magnitude tensor of shape (2, F, L).
         """
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)  # (1, L)
         stft_c = torch.stft(
             wav,
             n_fft=self.win_length,
@@ -62,38 +62,26 @@ class Unet2DWrapper(nn.Module):
 
         # only keep freqs smaller than self.F
         stft_c = stft_c[:, : self.F, :]  # (C, F, L)
-        mag = stft_c.abs()               # (C, F, L)
+        mag = stft_c.abs()  # (C, F, L)
 
-        # For compatibility with existing code expecting last dim=2, we keep a 4D "stft" with trailing singleton dim
-        stft = stft_c.unsqueeze(-1)      # (C, F, L, 1) complex view
-
-        return stft, mag
+        return stft_c, mag
 
     def inverse_stft(self, stft: Tensor) -> Tensor:
         """Inverse STFT back to waveform.
 
         Args:
-            stft: complex tensor with shape (C, F, L, 1) or (C, F, L).
+            stft: complex tensor with shape (C, F, L).
 
         Returns:
             wav: Tensor of shape (C, L) (stereo for Splitter).
         """
-        # Collapse trailing singleton dim if present
-        if stft.dim() == 4 and stft.size(-1) == 1:
-            stft_c = stft.squeeze(-1)  # (C, F, L) complex
-        else:
-            stft_c = stft  # assume already (C, F, L) complex
-
         # Pad frequency axis back to win_length//2+1 as expected by istft
         # Current stft_c: (C, F, L), F <= self.win_length//2+1
-        C, F_cur, L = stft_c.shape
-        F_expected = self.win_length // 2 + 1
-        if F_cur < F_expected:
-            pad = F_expected - F_cur
-            stft_c = F.pad(stft_c, (0, 0, 0, pad))  # pad frequency dimension at the end
+        pad = self.win_length // 2 + 1 - stft.size(1)
+        stft = F.pad(stft, (0, 0, 0, max(0, pad)))
 
         wav = torch.istft(
-            stft_c,
+            stft,
             n_fft=self.win_length,
             hop_length=self.hop_length,
             center=True,
@@ -106,37 +94,31 @@ class Unet2DWrapper(nn.Module):
         Separates stereo wav into different tracks (1 predicted track per stem)
         Args:
             wav (tensor): 2 x L
+
         Returns:
-            masked stfts by track name
+            specs (Dict[name, Tensor]): masked stfts by track name (2 x F x L)
         """
-        # stft_c: 2 x F x L x 1 (complex), stft_mag: 2 x F x L (real)
-        stft, stft_mag = self.compute_stft(wav.squeeze())
+        stft, stft_mag = self.compute_stft(wav)
 
         L = stft_mag.size(2)
 
-        # Prepare magnitude for UNet: 1 x 2 x F x T -> batchify -> B x 2 x T x F
-        stft_mag_feat = stft_mag.unsqueeze(-1).permute(3, 0, 1, 2)  # (1, 2, F, L)
-        stft_mag_feat = batchify(stft_mag_feat, self.T)             # (B, 2, F, T)
-        stft_mag_feat = stft_mag_feat.transpose(2, 3)               # (B, 2, T, F)
+        stft_mag_feat = stft_mag.unsqueeze(0)  # (1, 2, F, L)
+        stft_mag_feat = pad_to_length(stft_mag_feat, self.T)  # (1, 2, F, T)
+        stft_mag_feat = stft_mag_feat.transpose(2, 3)  # (1, 2, T, F)
 
         # compute stems' masks in feature space
-        masks = {name: net(stft_mag_feat) for name, net in self.stems.items()}  # each: (B, 2, T, F)
+        masks = {name: net(stft_mag_feat) for name, net in self.stem_nets.items()}  # each: (B, 2, T, F)
 
-        # compute denominator
-        mask_sum = sum([m**2 for m in masks.values()])
-        mask_sum += 1e-10
+        mask_sum = sum([m ** 2 for m in masks.values()]) # B x 2 x T x F
+        mask_sum += 1e-10  # avoid div by zero
 
         def apply_mask(mask: Tensor) -> Tensor:
             # normalize masks
-            mask = (mask**2 + 1e-10 / 2) / (mask_sum)
+            mask = (mask ** 2) / mask_sum
             mask = mask.transpose(2, 3)  # B x 2 x F x T
 
-            # undo batchify: concat segments along time
-            mask = torch.cat(torch.split(mask, 1, dim=0), dim=3)  # 1 x 2 x F x L
-
             # match original STFT length
-            mask = mask.squeeze(0)[:, :, :L].unsqueeze(-1)  # 2 x F x L x 1 (real mask)
-            # stft: 2 x F x L x 1 (complex) -> broadcast multiply
+            mask = mask.squeeze(0)[:, :, :L]  # 2 x F x L (real mask)
             stft_masked = stft * mask
             return stft_masked
 

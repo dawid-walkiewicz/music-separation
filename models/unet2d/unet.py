@@ -47,7 +47,7 @@ class UNet(nn.Module):
     def __init__(
         self,
         n_layers: int = 6,
-        in_channels: int = 1,
+        in_channels: int = 2,
     ) -> None:
         super().__init__()
 
@@ -56,7 +56,7 @@ class UNet(nn.Module):
         self.encoder_layers = nn.ModuleList(
             [
                 EncoderBlock(in_channels=in_ch, out_channels=out_ch)
-                for in_ch, out_ch in zip(down_set[:-1], down_set[1:])
+                for in_ch, out_ch in zip(down_set[:-1], down_set[1:]) # (0, n-1)x(1, n)
             ]
         )
 
@@ -77,11 +77,18 @@ class UNet(nn.Module):
         )
 
         # reconstruct the final mask same as the original channels
-        self.up_final = nn.Conv2d(1, in_channels, kernel_size=4, dilation=2, padding=3)
+        self.up_final = nn.Conv2d(1, out_channels=in_channels, kernel_size=4, dilation=2, padding=3)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, input: Tensor) -> Tensor:
-        encoder_outputs_pre_act = []
+        """
+        Args:
+            input (torch.Tensor): B x C x T x F
+
+        Returns:
+            mask (torch.Tensor): B x C x T x F
+        """
+        encoder_outputs_pre_act = [] # store pre-activation outputs for skip connections
         x = input
         for down in self.encoder_layers:
             conv, x = down(x)

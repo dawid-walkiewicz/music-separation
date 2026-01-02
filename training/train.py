@@ -45,7 +45,7 @@ def log_status(epoch, running_loss, log_every, epoch_size, last_log_time):
     return current_time
 
 
-def run_eval(epoch, model, device, data_root, sources, segment_seconds):
+def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers):
     model.eval()
 
     metrics = eval_unet(
@@ -55,8 +55,8 @@ def run_eval(epoch, model, device, data_root, sources, segment_seconds):
         segment_seconds=segment_seconds,
         device=device,
         subset="test",
-        batch_size=4,
-        num_workers=4,
+        batch_size=batch_size,
+        num_workers=num_workers,
     )
 
     model.train()
@@ -184,7 +184,7 @@ def train(
             running_loss = 0.0
 
         if epoch % eval_every == 0:
-            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds)
+            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers)
             current_si_sdr = metrics.get("si_sdr/mean", float("-inf"))            
 
         if epoch % ckpt_every == 0:

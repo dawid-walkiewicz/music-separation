@@ -43,7 +43,7 @@ def separate_sources(model: Unet2DWrapper, mixture: torch.Tensor, device: torch.
     mixture = mixture.to(device)
     with torch.no_grad():
         out = model.separate(mixture)
-    stem_names = list(model.stems.keys())
+    stem_names = list(model.stem_nets.keys())
     preds = [out[name].cpu().numpy() for name in stem_names]  # (2, L)
     preds = np.stack(preds, axis=0)  # (S, 2, L)
     preds = preds.mean(axis=1, keepdims=True)  # (S, 1, L)
@@ -177,7 +177,7 @@ def build_parser():
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--data_root", type=str, default="./musdb18-wav", help="MUSDB18 data root directory")
     parser.add_argument("--output_dir", type=str, default="./demonstration/spectrograms", help="Directory to save spectrograms")
-    parser.add_argument("--samples", type=int, default=2, help="Number of random samples to visualize")
+    parser.add_argument("--samples", type=int, default=2, help="Number of samples to visualize")
     parser.add_argument("--segment_seconds", type=float, default=6.0, help="Segment length in seconds")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed for sample selection")
     return parser
