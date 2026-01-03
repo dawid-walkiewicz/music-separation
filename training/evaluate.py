@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from training.data import MusdbRandomChunks
-from training.model import apply_masks
+from models.unet1d.model import apply_masks
 from training import losses
 
 try:
