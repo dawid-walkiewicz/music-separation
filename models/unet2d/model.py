@@ -26,7 +26,7 @@ def pad_to_length(tensor: Tensor, target_length: int) -> Tensor:
 
 
 class Unet2DWrapper(nn.Module):
-    def __init__(self, stem_names: List[str] = None):
+    def __init__(self, stem_names: List[str] = None, layers: int = 6):
         super().__init__()
 
         assert stem_names, "Must provide stem names."
@@ -37,7 +37,7 @@ class Unet2DWrapper(nn.Module):
         self.hop_length = 1024
         self.win = nn.Parameter(torch.hann_window(self.win_length), requires_grad=False)
 
-        self.stem_nets = nn.ModuleDict({name: UNet() for name in stem_names})
+        self.stem_nets = nn.ModuleDict({name: UNet(n_layers=layers) for name in stem_names})
 
     def compute_stft(self, wav: Tensor) -> Tuple[Tensor, Tensor]:
         """

@@ -15,6 +15,9 @@ from training.logger import Logger
 from training.utils import load_checkpoint, save_checkpoint
 from training.losses import get_loss_fn
 
+from torch.utils.tensorboard import SummaryWriter
+
+
 torch.backends.cudnn.benchmark = True
 
 def seed_worker(worker_id):
@@ -33,7 +36,7 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def log_status(epoch, running_loss, log_every, epoch_size, last_log_time, logger):
+def log_status(epoch, running_loss, log_every, epoch_size, last_log_time, logger, writer):
     avg_loss = running_loss / (log_every * epoch_size)
 
     current_time = time.monotonic()
@@ -50,10 +53,12 @@ def log_status(epoch, running_loss, log_every, epoch_size, last_log_time, logger
     }
     logger.log(log)
 
+    writer.add_scalar("Loss/train", avg_loss, epoch)
+
     return current_time
 
 
-def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers, logger):
+def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers, logger, writer):
     model.eval()
 
     metrics = eval_unet(
@@ -71,16 +76,17 @@ def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_si
 
     if metrics:
         print(f"[Eval] Epoch {epoch:6d} | Metrics:")
-        for key in metrics.keys():
-            print(f"    {key:16s}: {metrics[key]:8.3f}")
+
+        log = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "epoch": epoch}
+        log.update(metrics)
+        logger.log(log)
+
+        for key, value in metrics.items():
+            print(f"    {key:16s}: {value:8.3f}")
+            writer.add_scalar(f"Eval/{key.replace('/', '_')}", value, epoch)
     else:
         print(f"[Eval] Epoch {epoch:6d} | No metrics returned from eval_unet")
 
-    log = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "epoch": epoch}
-
-    log.update(metrics)
-
-    logger.log(log)
     return metrics
 
 
@@ -99,6 +105,7 @@ def train(
         workdir: str = "./runs/unet2d",
         batch_size: int = 4,
         lr: float = 2e-4,
+        layers: int = 6,
         epochs: int = 400,
         epoch_size: int = 50,
         log_every: int = 1,
@@ -147,7 +154,7 @@ def train(
         generator=g,
     )
 
-    model = Unet2DWrapper(stem_names=sources).to(device)
+    model = Unet2DWrapper(stem_names=sources, layers=layers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
@@ -161,6 +168,8 @@ def train(
 
     loss_logger = Logger(workdir / f"loss_{date}.csv", ["timestamp", "epoch", "avg_loss"])
     eval_logger = Logger(workdir / f"eval_{date}.csv", ["timestamp", "epoch"] + [f"si_sdr/{s}" for s in sources] + ["si_sdr/mean"])
+
+    writer = SummaryWriter(log_dir=str(workdir / f"tb_logs_{date}"))
 
     # Optional resume
     start_epoch = 0
@@ -191,11 +200,11 @@ def train(
                 break
 
         if epoch % log_every == 0:
-            last_log_time = log_status(epoch, running_loss, log_every, epoch_size, last_log_time, loss_logger)
+            last_log_time = log_status(epoch, running_loss, log_every, epoch_size, last_log_time, loss_logger, writer)
             running_loss = 0.0
 
         if epoch % eval_every == 0:
-            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers, eval_logger)
+            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers, eval_logger, writer)
             current_si_sdr = metrics.get("si_sdr/mean", float("-inf"))            
 
         if epoch % ckpt_every == 0:
@@ -210,6 +219,7 @@ def train(
                 if prune_checkpoints and path.exists():
                     prune_previous_checkpoint(ckpt_dir, epoch, ckpt_every)
 
+    writer.close()
     # Final save
     ckpt_path = ckpt_dir / f"final_step_{step:06d}.pt"
     save_checkpoint(ckpt_path, model, optimizer, epoch, step, scaler)
@@ -224,6 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--workdir", type=str, default="./runs/unet2d")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--layers", type=int, default=6, help="Number of U-Net layers")
     parser.add_argument("--epochs", type=int, default=400, help="Number of epochs to train")
     parser.add_argument("--epoch_size", type=int, default=50, help="Number of steps per epoch")
     parser.add_argument("--log_every", type=int, default=1, help="Log every N epochs")
@@ -248,6 +259,7 @@ if __name__ == "__main__":
         workdir=args.workdir,
         batch_size=args.batch_size,
         lr=args.lr,
+        layers=args.layers,
         epochs=args.epochs,
         epoch_size=args.epoch_size,
         log_every=args.log_every,
