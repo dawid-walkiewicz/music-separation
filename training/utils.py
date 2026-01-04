@@ -40,13 +40,3 @@ def load_checkpoint(path: Path,
     epoch = int(ckpt.get("epoch", 0))
     step = int(ckpt.get("step", 0))
     return epoch, step
-
-
-def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:
-    if not ckpt_dir.exists():
-        return None
-    ckpts = sorted(ckpt_dir.glob("step_*.pt"))
-    if ckpts:
-        return ckpts[-1]
-    finals = sorted(ckpt_dir.glob("final_step_*.pt"))
-    return finals[-1] if finals else None

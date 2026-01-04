@@ -11,7 +11,8 @@ from models.unet2d.model import Unet2DWrapper
 from models.unet2d.train_step import train_step
 from training.data import MusdbRandomChunks
 from models.unet2d.eval import evaluate as eval_unet
-from training.utils import load_checkpoint, save_checkpoint, find_latest_checkpoint
+from training.logger import Logger
+from training.utils import load_checkpoint, save_checkpoint
 from training.losses import get_loss_fn
 
 torch.backends.cudnn.benchmark = True
@@ -32,7 +33,7 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def log_status(epoch, running_loss, log_every, epoch_size, last_log_time):
+def log_status(epoch, running_loss, log_every, epoch_size, last_log_time, logger):
     avg_loss = running_loss / (log_every * epoch_size)
 
     current_time = time.monotonic()
@@ -42,10 +43,17 @@ def log_status(epoch, running_loss, log_every, epoch_size, last_log_time):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] | Epoch {epoch:6d} | Avg Loss: {avg_loss:.5f} | {steps_per_sec:.2f} steps/s")
 
+    log = {
+        "timestamp": timestamp,
+        "epoch": epoch,
+        "avg_loss": avg_loss,
+    }
+    logger.log(log)
+
     return current_time
 
 
-def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers):
+def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers, logger):
     model.eval()
 
     metrics = eval_unet(
@@ -68,6 +76,11 @@ def run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_si
     else:
         print(f"[Eval] Epoch {epoch:6d} | No metrics returned from eval_unet")
 
+    log = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "epoch": epoch}
+
+    log.update(metrics)
+
+    logger.log(log)
     return metrics
 
 
@@ -83,7 +96,7 @@ def prune_previous_checkpoint(ckpt_dir: Path, current_epoch: int, ckpt_every: in
 
 def train(
         data_root: str = "./musdb18-wav",
-        workdir: str = "./runs/unet1d",
+        workdir: str = "./runs/unet2d",
         batch_size: int = 4,
         lr: float = 2e-4,
         epochs: int = 400,
@@ -142,23 +155,21 @@ def train(
     print(f"Using loss: {loss_name}")
 
     workdir = Path(workdir)
-    ckpt_dir = workdir / "checkpoints"
+    date = datetime.now().strftime("%d.%m.%Y_%H-%M-%S")
+    ckpt_dir = workdir / date
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    loss_logger = Logger(workdir / f"loss_{date}.csv", ["timestamp", "epoch", "avg_loss"])
+    eval_logger = Logger(workdir / f"eval_{date}.csv", ["timestamp", "epoch"] + [f"si_sdr/{s}" for s in sources] + ["si_sdr/mean"])
 
     # Optional resume
     start_epoch = 0
     step = 0
     if resume:
-        ckpt_path: Path | None
-        if resume == "auto":
-            ckpt_path = find_latest_checkpoint(ckpt_dir)
-            if ckpt_path is None:
-                print("No checkpoints found for auto-resume — starting from scratch.")
-        else:
-            ckpt_path = Path(resume)
-            if not ckpt_path.exists():
-                print(f"Warning: {ckpt_path} not found, starting from scratch.")
-                ckpt_path = None
+        ckpt_path = Path(resume)
+        if not ckpt_path.exists():
+            print(f"Warning: {ckpt_path} not found, starting from scratch.")
+            ckpt_path = None
         if ckpt_path is not None:
             start_epoch, step = load_checkpoint(ckpt_path, model, optimizer, scaler)
             print(f"Resumed from: {ckpt_path} | epoch={start_epoch}")
@@ -180,11 +191,11 @@ def train(
                 break
 
         if epoch % log_every == 0:
-            last_log_time = log_status(epoch, running_loss, log_every, epoch_size, last_log_time)
+            last_log_time = log_status(epoch, running_loss, log_every, epoch_size, last_log_time, loss_logger)
             running_loss = 0.0
 
         if epoch % eval_every == 0:
-            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers)
+            metrics = run_eval(epoch, model, device, data_root, sources, segment_seconds, batch_size, num_workers, eval_logger)
             current_si_sdr = metrics.get("si_sdr/mean", float("-inf"))            
 
         if epoch % ckpt_every == 0:
@@ -210,7 +221,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train a 1D U-Net for audio source separation (MUSDB18)")
     parser.add_argument("--data_root", type=str, default="./musdb18-wav")
-    parser.add_argument("--workdir", type=str, default="./runs/unet1d")
+    parser.add_argument("--workdir", type=str, default="./runs/unet2d")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=400, help="Number of epochs to train")
@@ -220,7 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--segment_seconds", type=float, default=6.0, help="Segment length in seconds")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of DataLoader workers")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume", type=str, default=None, help='path to checkpoint or "auto"')
+    parser.add_argument("--resume", type=str, default=None, help='path to checkpoint')
     parser.add_argument("--loss", type=str, default="si_sdr_l1",
                         choices=["l1", "l2", "si_sdr", "mrstft", "si_sdr_l1"],
                         help="Loss to use: l1, l2, si_sdr, mrstft, si_sdr_l1 (hybrid)")
